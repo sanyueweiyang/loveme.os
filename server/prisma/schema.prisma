@@ -1,0 +1,96 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    Int     @id @default(autoincrement())
+  email String  @unique
+  name  String?
+}
+
+// 产品工作底稿 OS - 核心模型
+model PlanNode {
+  id            Int        @id @default(autoincrement())
+  title         String
+  description   String?
+  owner         String?    // '黄心怡' | '樊云川'
+  level         Int        @default(1) // 1-6 (L1-L6)
+  priority      String     @default("P1") // 'P0' | 'P1' | 'P2' | 'P3' | 'P4'
+  
+  // 层级结构与性能优化
+  parentId      Int?       // 父节点 ID
+  parent        PlanNode?  @relation("ParentChild", fields: [parentId], references: [id])
+  children      PlanNode[] @relation("ParentChild")
+  
+  rootId        Int?       // 根节点 ID (Performance: avoid recursive queries)
+  
+  // 进度与状态
+  plannedEndDate String?   // 上线时间 (e.g. '3月下旬', '1月内')
+  actualEndDate  DateTime? // 实际完成时间
+  planStatus     String?   // 计划状态 (e.g. '上线', '提测')
+  periodType     String?   // 'YEAR' | 'MONTH' | 'WEEK'
+  
+  progress       Float     @default(0) // 0-100
+  status         String    @default("PLANNED") // Enum: PLANNED, IN_PROGRESS, COMPLETED, PAUSED, CANCELLED
+  outputContent  String?   // 产出内容
+  
+  // [New] Reporting Fields
+  dataFeedback   String?   // 数据情况
+  issueLog       String?   // 问题反馈
+  
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  
+  @@index([rootId])
+  @@index([periodType])
+  @@index([updatedAt])
+  @@index([status])
+}
+
+// enum Priority {
+//   P0
+//   P1
+//   P2
+//   P3
+//   P4
+// }
+
+// enum NodeStatus {
+//   PLANNED
+//   IN_PROGRESS
+//   COMPLETED
+//   PAUSED
+//   CANCELLED
+// }
+
+// 每日工作日志 (用于工时计算)
+model WorkLog {
+  id            Int      @id @default(autoincrement())
+  content       String   
+  relatedNodeId Int?     
+  startTime     DateTime?
+  endTime       DateTime?
+  createdAt     DateTime @default(now())
+}
+
+// 推送历史存档
+model PushHistory {
+  id           Int      @id @default(autoincrement())
+  content      String   // 推送的 Markdown 内容
+  status       String   // 'SUCCESS' | 'FAILED'
+  platform     String   // 'WECHAT'
+  
+  // 报表维度增强
+  reportType   String?  // 'WEEK' | 'HALF_MONTH' | 'MONTH' | 'YEAR'
+  reportPeriod String?  // e.g. '2024-03-H1', '2024-W12'
+  snapshotData String?  // JSON string: 报表生成时的全量任务快照
+  
+  createdAt    DateTime @default(now())
+  
+  @@index([reportType, reportPeriod])
+}
