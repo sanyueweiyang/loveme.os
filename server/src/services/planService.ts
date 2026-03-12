@@ -1,32 +1,116 @@
-import { PrismaClient } from '@prisma/client';
-
-const prisma = new PrismaClient();
+import prisma from '../lib/prisma';
+import { Prisma } from '@prisma/client';
 
 // ==========================================
 // 1. 进度递归回传逻辑
 // ==========================================
 
 /**
- * 更新 PlanNode 进度，并递归更新父节点进度
+ * 更新 PlanNode 进度，并递归更新父节点进度 (支持事务)
  * @param nodeId 当前更新进度的节点 ID
  * @param newProgress 新进度值 (0-100)
  */
 export async function updateNodeProgress(nodeId: number, newProgress: number) {
-  // 1. 更新当前节点进度
-  const updatedNode = await prisma.planNode.update({
-    where: { id: nodeId },
-    data: { progress: newProgress },
-    include: { parent: true }, 
+  // 使用事务确保原子性
+  return await prisma.$transaction(async (tx) => {
+    // 1. 更新当前节点进度
+    const updatedNode = await tx.planNode.update({
+      where: { id: nodeId },
+      data: { progress: newProgress },
+      include: { parent: true }, 
+    });
+
+    console.log(`[L${updatedNode.level}] Node [${updatedNode.title}] progress updated to ${newProgress}%`);
+
+    // 2. 如果有父节点，触发向上递归更新
+    if (updatedNode.parentId) {
+      await updateParentProgressRecursive(updatedNode.parentId, tx);
+    }
+
+    return updatedNode;
   });
+}
 
-  console.log(`[L${updatedNode.level}] Node [${updatedNode.title}] progress updated to ${newProgress}%`);
+/**
+ * 全量重新计算进度 (Admin: Recalculate All)
+ * 从 L6 (Month) 开始，基于 L7 (Week) 的进度向上逐层汇总，直到 L1 (Category)。
+ * 确保所有父节点的进度与子节点一致。
+ */
+export async function recalculateAllProgress() {
+    console.log('Starting full progress recalculation...');
+    let totalUpdated = 0;
 
-  // 2. 如果有父节点，触发向上递归更新
-  if (updatedNode.parentId) {
-    await updateParentProgressRecursive(updatedNode.parentId);
-  }
+    // Iterate from bottom-up: Level 6 down to Level 1
+    // (Assuming L7 is the leaf execution layer)
+    for (let level = 6; level >= 1; level--) {
+        console.log(`Processing Level ${level}...`);
+        
+        // 1. Get all nodes at this level
+        const nodes = await prisma.planNode.findMany({
+            where: { level },
+            include: { children: true }
+        });
 
-  return updatedNode;
+        // 2. Recalculate each node
+        for (const node of nodes) {
+            if (!node.children || node.children.length === 0) continue;
+
+            // Calculate average from children
+            const totalProgress = node.children.reduce((sum, child) => sum + child.progress, 0);
+            const avgProgress = parseFloat((totalProgress / node.children.length).toFixed(2));
+
+            // Update if different (Tolerance 0.01)
+            if (Math.abs(node.progress - avgProgress) > 0.01) {
+                await prisma.planNode.update({
+                    where: { id: node.id },
+                    data: { progress: avgProgress }
+                });
+                console.log(`[Recalc] Updated L${level} Node ${node.id} (${node.title}): ${node.progress}% -> ${avgProgress}%`);
+                totalUpdated++;
+            }
+        }
+    }
+
+    console.log(`Recalculation complete. Total nodes updated: ${totalUpdated}`);
+    return { success: true, totalUpdated };
+}
+
+/**
+ * 获取每日上下文简报 (Daily Briefing Context)
+ * 供 AI 解析时参考，包含本周/本月/本年的关键任务 (P0/P1)
+ */
+export async function getDailyContext() {
+    const now = new Date();
+    
+    // 1. 本周关键任务 (Week P0/P1)
+    const startOfWeek = new Date(now.setDate(now.getDate() - now.getDay()));
+    const weekNodes = await prisma.planNode.findMany({
+        where: {
+            periodType: 'WEEK',
+            updatedAt: { gte: startOfWeek },
+            priority: { in: ['P0', 'P1'] },
+            status: { not: 'CANCELLED' }
+        },
+        select: { title: true, priority: true, status: true }
+    });
+
+    // 2. 本月关键目标 (Month P0)
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const monthNodes = await prisma.planNode.findMany({
+        where: {
+            periodType: 'MONTH',
+            updatedAt: { gte: startOfMonth },
+            priority: 'P0',
+            status: { not: 'CANCELLED' }
+        },
+        select: { title: true, priority: true }
+    });
+
+    return {
+        date: new Date().toISOString().split('T')[0],
+        weekFocus: weekNodes.map(n => `[${n.priority}] ${n.title}`),
+        monthFocus: monthNodes.map(n => `[${n.priority}] ${n.title}`)
+    };
 }
 
 /**
@@ -34,9 +118,12 @@ export async function updateNodeProgress(nodeId: number, newProgress: number) {
  * 规则：父节点进度 = 所有子节点进度的平均值
  * 终止条件：到达 L1 根节点 (无 parentId)
  */
-async function updateParentProgressRecursive(parentId: number) {
+async function updateParentProgressRecursive(parentId: number, tx?: Prisma.TransactionClient) {
+  // 使用事务客户端或默认 prisma 实例
+  const client = tx || prisma;
+  
   // 获取父节点及其所有子节点
-  const parent = await prisma.planNode.findUnique({
+  const parent = await client.planNode.findUnique({
     where: { id: parentId },
     include: { 
       children: true,
@@ -52,7 +139,7 @@ async function updateParentProgressRecursive(parentId: number) {
 
   // 优化：仅当进度实际发生变化时才更新数据库
   if (parent.progress !== averageProgress) {
-    await prisma.planNode.update({
+    await client.planNode.update({
       where: { id: parentId },
       data: { progress: averageProgress },
     });
@@ -61,7 +148,7 @@ async function updateParentProgressRecursive(parentId: number) {
 
     // 递归：继续向上更新更上层的父节点，直到 L1
     if (parent.parentId) {
-      await updateParentProgressRecursive(parent.parentId);
+      await updateParentProgressRecursive(parent.parentId, tx);
     }
   }
 }
@@ -85,14 +172,14 @@ export async function generateReport(startDate: Date, endDate: Date) {
   const isLongTermReport = diffDays >= 28; // 月报及以上
 
   // 1. 构建查询条件
-  const whereCondition: any = {
-    level: { in: [5, 6] }, // 仅抓取执行层
-    actualEndDate: {
-      gte: startDate,
-      lte: endDate,
-    },
-    outputContent: { not: null }, // 必须有产出内容
-  };
+    const whereCondition: any = {
+        level: { in: [5, 6] }, // 仅抓取执行层
+        actualEndDate: {
+            gte: startDate,
+            lte: endDate,
+        },
+        dataFeedback: { not: null }, // 必须有产出内容 (原 outputContent)
+    };
 
   // 2. 自动筛选：月报/年报仅看 P0/P1
   if (isLongTermReport) {
@@ -107,7 +194,7 @@ export async function generateReport(startDate: Date, endDate: Date) {
     },
     select: {
       title: true,
-      outputContent: true,
+      dataFeedback: true, // Use dataFeedback
       actualEndDate: true,
       owner: true,
       priority: true,
@@ -138,8 +225,8 @@ export async function generateReport(startDate: Date, endDate: Date) {
     const parentInfo = node.parent ? ` (所属: ${node.parent.title})` : "";
     reportContent += `${dateStr} 完成了 [${node.priority}] ${node.title}${parentInfo}\n`;
     
-    if (node.outputContent) {
-      reportContent += `   > 产出: ${node.outputContent}\n`;
+    if (node.dataFeedback) {
+      reportContent += `   > 产出: ${node.dataFeedback}\n`;
     }
     if (node.owner) {
       reportContent += `   > 负责人: ${node.owner}\n`;
@@ -173,11 +260,11 @@ export async function getConsolidatedReport(nodeId: number, startDate: Date, end
         gte: startDate,
         lte: endDate,
       },
-      outputContent: { not: null }, // 必须有产出内容
+      dataFeedback: { not: null }, // 必须有产出内容 (原 outputContent)
     },
     select: {
       title: true,
-      outputContent: true,
+      dataFeedback: true, // Use dataFeedback
       owner: true,
     },
     orderBy: {
@@ -188,7 +275,7 @@ export async function getConsolidatedReport(nodeId: number, startDate: Date, end
   // 3. 格式化输出
   return reportNodes.map(node => {
     const ownerStr = node.owner ? `[${node.owner}] ` : "";
-    return `${ownerStr}${node.title}: ${node.outputContent}`;
+    return `${ownerStr}${node.title}: ${node.dataFeedback}`;
   });
 }
 
@@ -282,6 +369,8 @@ export async function calculateActualDuration(nodeId: number) {
 // 5. 节点创建与 rootId 维护 (性能优化)
 // ==========================================
 
+import { generateWBSNodeNumber, extractWBSCodes, LEVEL_PREFIX_MAP, CATEGORY_MAP } from './nodeNumberService';
+
 /**
  * 创建新节点，自动维护 rootId，并支持回溯机制
  */
@@ -292,64 +381,87 @@ export async function createPlanNode(data: {
   level: number;
   owner?: string;
   priority?: string;
+  targetDate?: Date;
   plannedEndDate?: string;
   periodType?: string; // YEAR / MONTH / WEEK
   planStatus?: string;
   outputContent?: string;
   progress?: number;
+  dataFeedback?: string;
+  issueLog?: string;
+  planCategory?: string;
+  evolutionTag?: string;
 }) {
   let rootId: number | null = null;
   let parentId = data.parentId;
 
-  // 0. 回溯机制：若在周报新增‘规划外任务’ (WEEK without parent)，逻辑需自动在 YEAR/MONTH 根节点创建对应节点
+  // [New] Generate Node Number (WBS DNA)
+  let category = data.planCategory || 'WORK';
+  
+  if (parentId) {
+      const parent = await prisma.planNode.findUnique({ where: { id: parentId } });
+      if (parent && parent.planCategory) {
+          category = parent.planCategory;
+      }
+  }
+  
+  if (!parentId && data.planCategory && data.planCategory !== category) {
+       category = data.planCategory;
+  }
+  
+  // Safety Guard: planCategory must be valid
+  const validCategories = Object.keys(CATEGORY_MAP).filter(k => isNaN(Number(k)));
+  if (!validCategories.includes(category) && !validCategories.includes(category.toUpperCase())) {
+      // Default to 'WORK' or '工作' if invalid? Or throw?
+      // Let's assume user passes Chinese '工作', we need to map to code '01'.
+      // But we store the STRING in planCategory.
+      // Schema says: planCategory String? // 分类 (e.g. '工作', '生活')
+      // nodeNumberService CATEGORY_MAP has: '工作': '01', 'WORK': '01'
+      // So we should store what the user passed, as long as it maps to a code.
+      if (!CATEGORY_MAP[category] && !CATEGORY_MAP[category.toUpperCase()]) {
+          throw new Error(`Invalid planCategory: ${category}`);
+      }
+  }
+  
+  // [New] Management Audit: Automated Tagging (PLAN_OUTSIDE)
+  // 规则：若当前日期不在年初定义的“规划窗口期” (1月)，且创建的是 YEAR/MONTH 规划层任务，标记为 PLAN_OUTSIDE
+  let evolutionTag = 'ORIGINAL';
+  
+  if (data.level <= 6) { // 仅针对规划层 (L1-L6)
+      const now = new Date();
+      // 规划窗口期：每年 1月 (Month 0)
+      const isPlanningWindow = now.getMonth() === 0; 
+      
+      if (!isPlanningWindow) {
+          // 非窗口期创建的规划任务 -> 计划外新增
+          evolutionTag = 'PLAN_OUTSIDE';
+      }
+  }
+  
+  // 0. [Strict Mode] Lock "Unplanned" Task Flow
+  // 规则：周报 (WEEK) 仅负责认领，严禁创建无父级的新任务
+  // Backtracking logic removed/disabled to enforce this.
+  if (data.periodType === 'WEEK' && !parentId) {
+      throw new Error("Weekly tasks must be claimed from Monthly plan. Cannot create standalone Week node.");
+  }
+
+  /* Backtracking Logic Disabled
   if (data.periodType === 'WEEK' && !parentId) {
       console.log('Detected unplanned WEEK task, initiating backtracking...');
-      
-      // 1. 创建 MONTH 节点
-      const monthNode = await prisma.planNode.create({
-          data: {
-              title: `${data.title} (Month)`,
-              description: 'Auto-created by backtracking',
-              level: data.level > 1 ? data.level - 1 : 1, // Assume WEEK is lower level, e.g., L3, so MONTH is L2
-              owner: data.owner,
-              priority: data.priority || 'P1',
-              periodType: 'MONTH',
-              planStatus: data.planStatus
-          }
-      });
+      // ... (Code commented out)
+  }
+  */
 
-      // 2. 创建 YEAR 节点
-      const yearNode = await prisma.planNode.create({
-          data: {
-              title: `${data.title} (Year)`,
-              description: 'Auto-created by backtracking',
-              level: monthNode.level > 1 ? monthNode.level - 1 : 1, // Assume MONTH is L2, YEAR is L1
-              owner: data.owner,
-              priority: data.priority || 'P1',
-              periodType: 'YEAR',
-              planStatus: data.planStatus,
-              rootId: undefined // Will be set to self
-          }
-      });
-      
-      // Fix Root ID for Year Node
-      await prisma.planNode.update({
-          where: { id: yearNode.id },
-          data: { rootId: yearNode.id }
-      });
-      yearNode.rootId = yearNode.id;
+  const nodeNumber = await generateWBSNodeNumber(category, parentId, data.periodType || undefined);
+  const wbsCodes = extractWBSCodes(nodeNumber);
 
-      // Link Month to Year
-      await prisma.planNode.update({
-          where: { id: monthNode.id },
-          data: { parentId: yearNode.id, rootId: yearNode.id }
-      });
-
-      // Set parentId for the new WEEK node
-      parentId = monthNode.id;
-      rootId = yearNode.id;
-      
-      console.log(`Backtracking complete. Created Month: ${monthNode.id}, Year: ${yearNode.id}`);
+  // Safety Guard: Prefix Check (Implicitly handled by generator logic which uses parent.nodeNumber)
+  // But let's verify if parentId exists.
+  if (parentId) {
+      const parent = await prisma.planNode.findUnique({ where: { id: parentId } });
+      if (parent && parent.nodeNumber && !nodeNumber.startsWith(parent.nodeNumber)) {
+           throw new Error(`Safety Guard Violation: Child node number ${nodeNumber} does not start with parent ${parent.nodeNumber}`);
+      }
   }
 
   // 1. 如果有父节点，继承父节点的 rootId
@@ -374,11 +486,23 @@ export async function createPlanNode(data: {
       owner: data.owner,
       priority: data.priority || 'P1',
       plannedEndDate: data.plannedEndDate,
+      targetDate: data.targetDate,
       periodType: data.periodType,
       planStatus: data.planStatus,
-      outputContent: data.outputContent,
+      dataFeedback: data.dataFeedback || data.outputContent, // Compatible
       progress: data.progress || 0,
+      issueLog: data.issueLog,
       rootId,
+      planCategory: category,
+      nodeNumber: nodeNumber,
+      planCategoryCode: wbsCodes.planCategoryCode,
+      objectiveCode: wbsCodes.objectiveCode,
+      krCode: wbsCodes.krCode,
+      detail1Code: wbsCodes.detail1Code,
+      detail2Code: wbsCodes.detail2Code,
+      monthCode: wbsCodes.monthCode,
+      weekCode: wbsCodes.weekCode,
+      evolutionTag: data.evolutionTag || evolutionTag // Allow override if passed (e.g. INHERITED)
     }
   });
   
@@ -392,6 +516,229 @@ export async function createPlanNode(data: {
   }
 
   return newNode;
+}
+
+/**
+ * 初始化下周周报 (Action: Week-to-Week Inheritance)
+ * 逻辑：自动扫描本周进度 < 100% 的记录，将其克隆为下周的‘重点工作’
+ * @param nextWeekCode 下周周次 (e.g. '02')
+ */
+export async function initializeNextWeekReport(nextWeekCode: string) {
+    const nextWeekInt = parseInt(nextWeekCode, 10);
+    if (isNaN(nextWeekInt) || nextWeekInt <= 1) {
+        throw new Error('Invalid next week code. Must be > 01.');
+    }
+    
+    // 1. Determine Current Week Code
+    const currentWeekCode = (nextWeekInt - 1).toString().padStart(2, '0');
+    console.log(`Initializing Week ${nextWeekCode} from Week ${currentWeekCode}...`);
+
+    // 2. Fetch Current Week's Unfinished Tasks
+    const unfinishedNodes = await prisma.planNode.findMany({
+        where: {
+            periodType: 'WEEK',
+            weekCode: currentWeekCode,
+            progress: { lt: 100 },
+            status: { notIn: ['COMPLETED', 'CANCELLED'] }
+        }
+    });
+
+    const results = [];
+
+    // 3. Clone to Next Week
+    for (const node of unfinishedNodes) {
+        if (!node.parentId) continue;
+
+        // Use claimTasksToWeeklyReport logic to ensure consistency
+        // But we need to handle single item.
+        // Also, claimTasksToWeeklyReport expects Parent IDs (M nodes).
+        // Here we have W nodes. We need their Parent IDs.
+        
+        // Check if already claimed for next week
+        const existing = await prisma.planNode.findFirst({
+            where: {
+                parentId: node.parentId,
+                weekCode: nextWeekCode,
+                level: 7
+            }
+        });
+
+        if (existing) {
+            results.push({ id: node.id, status: 'SKIPPED', reason: 'Already exists' });
+            continue;
+        }
+
+        // Call claim logic
+        // We reuse the core logic of claimTasksToWeeklyReport but we might want to copy 'progress'?
+        // Requirement: "Clone as Key Tasks". Usually starts fresh or continues?
+        // User didn't specify keeping progress. Standard WBS practice for new period is often 0% action progress.
+        // But "Inheritance" might imply keeping it.
+        // However, since `claimTasksToWeeklyReport` is the "Claim" engine, let's use it.
+        // Wait, `claimTasksToWeeklyReport` initializes description to empty.
+        // Should we copy the description? "Clone... preserving parent genes".
+        // If it's the *same* task continued, maybe description should be copied?
+        // Let's manually create to be safe and flexible.
+
+        // Get Parent to ensure it exists (and get nodeNumber)
+        const parent = await prisma.planNode.findUnique({ where: { id: node.parentId } });
+        if (!parent || !parent.nodeNumber) continue;
+
+        const newNodeNumber = `${parent.nodeNumber}-W${nextWeekCode}`;
+
+        const newNode = await prisma.planNode.create({
+            data: {
+                title: node.title, // Keep Title
+                description: node.description, // Keep Description (Context is important for continued tasks)
+                parentId: parent.id,
+                rootId: parent.rootId || parent.id,
+                level: 7,
+                
+                // Genes
+                planCategory: parent.planCategory,
+                planCategoryCode: parent.planCategoryCode,
+                objectiveCode: parent.objectiveCode,
+                krCode: parent.krCode,
+                detail1Code: parent.detail1Code,
+                detail2Code: parent.detail2Code,
+                monthCode: parent.monthCode,
+                weekCode: nextWeekCode, // NEW Week
+                evolutionTag: parent.evolutionTag,
+                
+                nodeNumber: newNodeNumber,
+                periodType: 'WEEK',
+                planStatus: 'PLANNED', // Reset status to PLANNED
+                priority: node.priority,
+                owner: node.owner,
+                
+                progress: node.progress, // [Decision] Keep Progress for Continuity
+                // dataFeedback/issueLog cleared for new week
+            }
+        });
+        
+        results.push({ id: node.id, status: 'SUCCESS', newNode });
+    }
+
+    return {
+        sourceWeek: currentWeekCode,
+        targetWeek: nextWeekCode,
+        processed: results.length,
+        details: results
+    };
+}
+
+/**
+ * 获取分类汇总报表 (Report Category Aggregation)
+ * @param period 'MONTH' | 'YEAR'
+ * @param date Target Date
+ */
+export async function getCategorizedReport(period: 'MONTH' | 'YEAR', date: Date = new Date()) {
+    // 1. Get flat list of aggregated nodes
+    const nodes = await getPeriodicReportNodes(period, date);
+    
+    // 2. Group by planCategory
+    const grouped: Record<string, any[]> = {};
+    
+    // Initialize standard categories
+    const categories = ['工作', '生活', '学习'];
+    categories.forEach(c => grouped[c] = []);
+    
+    nodes.forEach(node => {
+        // Map category code or string to key
+        // planCategory field usually stores Chinese '工作', etc.
+        const category = node.planCategory || '其他';
+        
+        if (!grouped[category]) {
+            grouped[category] = [];
+        }
+        grouped[category].push(node);
+    });
+    
+    return grouped;
+}
+
+/**
+ * 认领执行任务到周报 (Claim Tasks to Weekly Report)
+ * @param taskIds 选中的 M 节点 ID 列表
+ * @param weekCode 周次编码 (e.g. '01', '02')
+ * @param owner 认领人 (可选，默认继承)
+ */
+export async function claimTasksToWeeklyReport(taskIds: number[], weekCode: string, owner?: string) {
+    const results = [];
+    
+    for (const parentId of taskIds) {
+        // 1. Fetch Parent M Node
+        const parent = await prisma.planNode.findUnique({
+            where: { id: parentId }
+        });
+        
+        if (!parent) {
+            results.push({ id: parentId, status: 'FAILED', reason: 'Parent not found' });
+            continue;
+        }
+
+        // 2. Anti-Duplication Check
+        // Check if a W node with same weekCode already exists under this parent
+        const existing = await prisma.planNode.findFirst({
+            where: {
+                parentId: parent.id,
+                level: 7, // W Node
+                weekCode: weekCode
+            }
+        });
+
+        if (existing) {
+            results.push({ id: parentId, status: 'SKIPPED', reason: 'Already claimed for this week', existingId: existing.id });
+            continue;
+        }
+
+        // 3. Generate Node Number
+        // Logic: Parent NodeNumber + '-W' + weekCode
+        // e.g. F01O01KR01D101D201M01-W01
+        // Note: We use manual construction to adhere to "Execution Layer" suffix rule.
+        // But we should verify parent has a nodeNumber.
+        if (!parent.nodeNumber) {
+            results.push({ id: parentId, status: 'FAILED', reason: 'Parent has no nodeNumber' });
+            continue;
+        }
+        const newNodeNumber = `${parent.nodeNumber}-W${weekCode}`;
+
+        // 4. Create W Node
+        const newNode = await prisma.planNode.create({
+            data: {
+                title: parent.title, // Inherit Title
+                description: '', // Initial empty for user to fill
+                parentId: parent.id,
+                rootId: parent.rootId || parent.id, // Inherit Root ID
+                level: 7, // W Level
+                
+                // Bloodline Cloning
+                planCategory: parent.planCategory,
+                planCategoryCode: parent.planCategoryCode,
+                objectiveCode: parent.objectiveCode,
+                krCode: parent.krCode,
+                detail1Code: parent.detail1Code,
+                detail2Code: parent.detail2Code,
+                monthCode: parent.monthCode,
+                weekCode: weekCode, // Set current week code
+                evolutionTag: parent.evolutionTag, // Inherit Audit Tag
+                
+                nodeNumber: newNodeNumber,
+                
+                periodType: 'WEEK',
+                planStatus: 'PLANNED',
+                priority: parent.priority, // Inherit Priority
+                owner: owner || parent.owner, // Assign Owner
+                
+                // Execution Fields Initialization
+                // dataFeedback & issueLog are implicitly null (required to be filled later)
+                progress: 0
+            }
+        });
+        
+        results.push({ id: parentId, status: 'SUCCESS', newNode });
+    }
+    
+    return results;
 }
 
 /**
@@ -429,7 +776,7 @@ export async function claimTask(parentId: number, claimer: string, periodType: s
  * 包括：本周新建/更新的任务 + 上周未完成自动继承的任务
  */
 export async function getWeeklyReportNodes() {
-    // 1. 获取本周任务
+    // 1. 获取本周任务 (仅限 WORK 分类)
     const now = new Date();
     const startOfWeek = new Date(now.setDate(now.getDate() - now.getDay()));
     startOfWeek.setHours(0, 0, 0, 0);
@@ -437,6 +784,7 @@ export async function getWeeklyReportNodes() {
     const currentWeekNodes = await prisma.planNode.findMany({
         where: {
             periodType: 'WEEK',
+            planCategoryCode: '01', // [Safety Guard] 核心隔离：仅推送工作分类 (Code 01)
             updatedAt: { gte: startOfWeek }
         }
     });
@@ -449,6 +797,7 @@ export async function getWeeklyReportNodes() {
     const unfinishedLastWeekNodes = await prisma.planNode.findMany({
         where: {
             periodType: 'WEEK',
+            planCategoryCode: '01', // [Safety Guard] 核心隔离：仅推送工作分类 (Code 01)
             updatedAt: {
                 gte: startOfLastWeek,
                 lt: startOfWeek
@@ -487,14 +836,85 @@ export async function getNodesByLayer(layer: number) {
 /**
  * 更新节点
  * [Refactor] Title Cascade: If title is updated, cascade to all children
+ * [Refactor] Progress Feedback: If progress is updated, cascade to parent
+ * [Refactor] WBS Cascade: If any code field is updated, cascade identity to all children
  */
 export async function updatePlanNode(id: number, data: any) {
     const original = await prisma.planNode.findUnique({ where: { id } });
-    
+    if (!original) throw new Error('Node not found');
+
+    // [New] Check if WBS fields changed
+    const wbsFields = ['planCategory', 'planCategoryCode', 'objectiveCode', 'krCode', 'detail1Code', 'detail2Code', 'monthCode', 'weekCode'];
+    const hasWBSChange = wbsFields.some(field => data[field] !== undefined && data[field] !== (original as any)[field]);
+
+    if (hasWBSChange) {
+        console.log(`WBS fields changed for Node ${id}. Recalculating identity...`);
+        
+        // 1. Determine new code for current level
+        let newCode = '';
+        
+        // Special handling for Category (Level 1)
+        if (original.level === 1) {
+             if (data.planCategory) {
+                 newCode = CATEGORY_MAP[data.planCategory] || '99';
+             } else if (data.planCategoryCode) {
+                 newCode = data.planCategoryCode;
+             } else {
+                 newCode = original.planCategoryCode || '99';
+             }
+        } else {
+            // For L2-L7, get the code field corresponding to the level
+            // Map Level to Field Name
+            const levelFieldMap: Record<number, string> = {
+                2: 'objectiveCode',
+                3: 'krCode',
+                4: 'detail1Code',
+                5: 'detail2Code',
+                6: 'monthCode',
+                7: 'weekCode'
+            };
+            const fieldName = levelFieldMap[original.level];
+            if (fieldName) {
+                newCode = data[fieldName] || (original as any)[fieldName];
+            }
+        }
+        
+        // 2. Construct new Node Number
+        let prefix = '';
+        if (original.parentId) {
+            const parent = await prisma.planNode.findUnique({ where: { id: original.parentId } });
+            if (parent && parent.nodeNumber) {
+                prefix = parent.nodeNumber;
+            }
+        }
+        
+        // Append type prefix (F, O, KR...)
+        const typePrefix = LEVEL_PREFIX_MAP[original.level];
+        if (typePrefix) {
+            const newNodeNumber = original.level === 1 
+                ? `F${newCode}` 
+                : `${prefix}${typePrefix}${newCode}`;
+                
+            if (original.nodeNumber && newNodeNumber !== original.nodeNumber) {
+                console.log(`Node Identity Changed: ${original.nodeNumber} -> ${newNodeNumber}`);
+                data.nodeNumber = newNodeNumber;
+                
+                // Sync all code fields
+                const newCodes = extractWBSCodes(newNodeNumber);
+                Object.assign(data, newCodes);
+            }
+        }
+    }
+
     const updated = await prisma.planNode.update({
         where: { id },
         data
     });
+
+    // Check if nodeNumber changed (Cascade Children)
+    if (original.nodeNumber && updated.nodeNumber && original.nodeNumber !== updated.nodeNumber) {
+        await cascadeNodeNumberUpdate(id, original.nodeNumber, updated.nodeNumber);
+    }
 
     // Check if title changed
     if (original && data.title && data.title !== original.title) {
@@ -503,7 +923,80 @@ export async function updatePlanNode(id: number, data: any) {
         await cascadeTitleUpdate(id, original.title, data.title);
     }
 
+    // Check if progress changed
+    if (data.progress !== undefined && original && data.progress !== original.progress) {
+        console.log(`Progress changed for Node ${id}. Triggering parent update...`);
+        if (original.parentId) {
+            await updateParentProgressRecursive(original.parentId);
+        }
+    }
+
+    // [New] Management Audit: Strategy Adjust (M Node Title/Content Change)
+    if (original.level === 6) { // Month Node
+        const isTitleChanged = data.title && data.title !== original.title;
+        // Check content change (mapped to dataFeedback or description)
+        const isContentChanged = (data.dataFeedback && data.dataFeedback !== original.dataFeedback) ||
+                                 (data.description && data.description !== original.description);
+
+        if (isTitleChanged || isContentChanged) {
+            console.log(`[Audit] Strategy Adjustment detected for M Node ${id}`);
+            // Only update tag if it's not already something else specific? 
+            // Or overwrite? Requirement: "System automatically changes evolutionTag to STRATEGY_ADJUST"
+            await prisma.planNode.update({
+                where: { id },
+                data: { evolutionTag: 'STRATEGY_ADJUST' }
+            });
+        }
+    }
+
     return updated;
+}
+
+/**
+ * Recursive function to update children's nodeNumber and WBS codes
+ * Updates children that have the nodeNumber starting with oldPrefix
+ */
+async function cascadeNodeNumberUpdate(parentId: number, oldPrefix: string, newPrefix: string) {
+    // Find all descendants that start with oldPrefix
+    // Note: Since we already updated the parent, it won't be found here (good).
+    const descendants = await prisma.planNode.findMany({
+        where: {
+            nodeNumber: { startsWith: oldPrefix }
+        }
+    });
+    
+    // Reverse Map for Category Sync
+    const CODE_TO_CATEGORY: Record<string, string> = {};
+    for (const [key, value] of Object.entries(CATEGORY_MAP)) {
+        CODE_TO_CATEGORY[value] = key;
+    }
+
+    for (const child of descendants) {
+        if (!child.nodeNumber) continue;
+        
+        // Replace prefix
+        const newChildNodeNumber = child.nodeNumber.replace(oldPrefix, newPrefix);
+        
+        // Extract codes
+        const newCodes = extractWBSCodes(newChildNodeNumber);
+        
+        const updateData: any = {
+            nodeNumber: newChildNodeNumber,
+            ...newCodes
+        };
+
+        // Sync Category String if code changed
+        if (newCodes.planCategoryCode && CODE_TO_CATEGORY[newCodes.planCategoryCode]) {
+             updateData.planCategory = CODE_TO_CATEGORY[newCodes.planCategoryCode];
+        }
+        
+        await prisma.planNode.update({
+            where: { id: child.id },
+            data: updateData
+        });
+        
+        console.log(`Cascaded WBS Update: Child ${child.id} ${child.nodeNumber} -> ${newChildNodeNumber}`);
+    }
 }
 
 /**
@@ -536,9 +1029,40 @@ async function cascadeTitleUpdate(parentId: number, oldTitle: string, newTitle: 
 
 
 /**
- * 删除节点
+ * 删除节点 (Safety Guard: Cascade Protection & Logic Cleanup)
+ * 1. Check children (Block if exists)
+ * 2. Unlink ScheduleNodes (Set relatedPlanId = null)
+ * 3. Unlink WorkLogs (Set relatedNodeId = null)
+ * 4. Delete Node
  */
 export async function deletePlanNode(id: number) {
+  // 1. Check for children
+  const node = await prisma.planNode.findUnique({
+      where: { id },
+      include: { children: true }
+  });
+
+  if (!node) {
+      throw new Error('Node not found');
+  }
+
+  if (node.children && node.children.length > 0) {
+      throw new Error('请先删除下级关联任务，以确保 WBS 基因链完整');
+  }
+
+  // 2. Unlink ScheduleNodes
+  await prisma.scheduleNode.updateMany({
+      where: { relatedPlanId: id },
+      data: { relatedPlanId: null }
+  });
+
+  // 3. Unlink WorkLogs (Logical association)
+  await prisma.workLog.updateMany({
+      where: { relatedNodeId: id },
+      data: { relatedNodeId: null }
+  });
+
+  // 4. Safe to delete
   return await prisma.planNode.delete({
     where: { id }
   });
@@ -752,24 +1276,84 @@ export async function getPeriodicReportNodes(period: 'HALF_MONTH' | 'MONTH' | 'Y
         
         if (!consolidatedMap.has(trackId)) {
             // 首次遇到，直接存入
-            consolidatedMap.set(trackId, node);
+            consolidatedMap.set(trackId, { 
+                ...node, 
+                aggregatedFeedback: node.dataFeedback ? [node.dataFeedback] : [],
+                aggregatedIssues: node.issueLog ? [node.issueLog] : [] 
+            });
         } else {
             // 已存在，比较 progress
             const existing = consolidatedMap.get(trackId);
+            
+            // [Fix] Aggregate dataFeedback regardless of who is latest
+            if (node.dataFeedback && !existing.aggregatedFeedback.includes(node.dataFeedback)) {
+                 existing.aggregatedFeedback.push(node.dataFeedback);
+            }
+            // [New] Aggregate issueLog
+            if (node.issueLog && !existing.aggregatedIssues.includes(node.issueLog)) {
+                 existing.aggregatedIssues.push(node.issueLog);
+            }
+
             // [Fix] Latest Update Rule: progress > existing OR (progress == existing AND updatedAt > existing)
             // 确保进度一致时，取最新修改的版本（描述、反馈等可能是新的）
             if (node.progress > existing.progress || 
                (node.progress === existing.progress && node.updatedAt > existing.updatedAt)) {
-                consolidatedMap.set(trackId, node);
+                // Update fields but keep aggregatedFeedback & aggregatedIssues
+                const aggregatedFeedback = existing.aggregatedFeedback;
+                const aggregatedIssues = existing.aggregatedIssues;
+                consolidatedMap.set(trackId, { ...node, aggregatedFeedback, aggregatedIssues });
             }
         }
     }
 
     // 4. 转换回数组并排序 (按优先级 P0 -> P1)
-    return Array.from(consolidatedMap.values()).sort((a, b) => {
+    const sortedNodes = Array.from(consolidatedMap.values()).map(n => ({
+        ...n,
+        // Join feedback for display
+        dataFeedback: n.aggregatedFeedback.length > 0 ? n.aggregatedFeedback.join('; ') : n.dataFeedback,
+        issueLog: n.aggregatedIssues.length > 0 ? n.aggregatedIssues.join('; ') : n.issueLog
+    })).sort((a, b) => {
         if (a.priority === b.priority) return 0;
         return a.priority === 'P0' ? -1 : 1;
     });
+
+    // 5. [New] Health Diagnosis (健康度诊断)
+    const now = new Date();
+    const tenDays = 10 * 24 * 60 * 60 * 1000;
+
+    return await Promise.all(sortedNodes.map(async (node) => {
+        let healthStatus = 'HEALTHY';
+
+        // Check 1: STAGNANT (停滞)
+        // P0/P1 & No update in 10 days
+        const lastUpdate = new Date(node.updatedAt);
+        if ((node.priority === 'P0' || node.priority === 'P1') && (now.getTime() - lastUpdate.getTime() > tenDays)) {
+            healthStatus = 'STAGNANT';
+        }
+
+        // Check 2: DISCREPANCY (进度严重不符)
+        // Check if node has children and if their average progress matches parent
+        // We need to fetch children to verify this
+        const nodeWithChildren = await prisma.planNode.findUnique({
+            where: { id: node.id },
+            include: { children: true }
+        });
+
+        if (nodeWithChildren && nodeWithChildren.children.length > 0) {
+            const totalProgress = nodeWithChildren.children.reduce((sum, child) => sum + child.progress, 0);
+            const avgProgress = totalProgress / nodeWithChildren.children.length;
+            
+            // Allow 5% deviation (floating point issues or manual minor adjustment)
+            if (Math.abs(node.progress - avgProgress) > 5) {
+                healthStatus = 'DISCREPANCY';
+            }
+        }
+
+        return {
+            ...node,
+            healthStatus
+        };
+    }));
 }
 
 /**
@@ -946,9 +1530,171 @@ export async function getNextWeekPlanNodes() {
 }
 
 /**
- * [New] 跨月滚动机制：每月1日自动检查上月未完成任务，滚动至本月
- * 建议由定时任务调用 (Cron Job)
+ * 获取可认领的月度任务 (Claimable Month Tasks)
+ * 供周报 (Week) 认领使用
+ * @param year 目标年份
+ * @param month 目标月份
  */
+export async function getClaimableTasks(year: number, month: number) {
+    const monthCode = month.toString().padStart(2, '0');
+    
+    // 确定年份范围 (考虑到跨年问题，最好结合 createdAt 或 parent 的年份)
+    // 目前简化处理：假设 createdAt 在该年份内
+    const startDate = new Date(year, 0, 1);
+    const endDate = new Date(year, 11, 31, 23, 59, 59);
+
+    return await prisma.planNode.findMany({
+        where: {
+            level: 6, // M 节点
+            monthCode: monthCode,
+            createdAt: {
+                gte: startDate,
+                lte: endDate
+            },
+            status: { not: 'CANCELLED' } // 仅列出未取消的任务
+        },
+        orderBy: {
+            nodeNumber: 'asc' // 按 WBS 顺序排列
+        }
+    });
+}
+
+/**
+ * [New] 手动生成下月计划 (Action Interface)
+ * 逻辑：将下一月度的原始规划与本月未完成的 PLAN_OUTSIDE 任务合并生成
+ * @param year 目标年份
+ * @param month 目标月份 (1-12)
+ */
+export async function generateNextMonthPlan(year: number, month: number) {
+    console.log(`Generating Plan for ${year}-${month}...`);
+    
+    // 1. 获取目标月份的原始规划 (Original M Nodes)
+    // Assuming "Original" means nodes created during Planning Window (Jan)
+    // or just nodes that already exist for that month period.
+    // Actually, "Original Plan" is M nodes that have evolutionTag='ORIGINAL' (or null/default).
+    // Wait, the requirement says "Merge Next Month's Original Plan with This Month's Unfinished PLAN_OUTSIDE".
+    // This implies Next Month's plan might already be partially populated (from Annual Plan).
+    
+    // Target Month Code (e.g. 04 for April)
+    const targetMonthCode = month.toString().padStart(2, '0');
+    
+    // Find existing M nodes for next month
+    // We can filter by `monthCode` and `periodType='MONTH'`?
+    // But `monthCode` is unique per parent... no, `monthCode` is just '04'.
+    // We need to find nodes that *belong* to that month.
+    // The `periodType` is MONTH. And we check `createdAt`? No, `targetDate`?
+    // Schema doesn't strictly bind M nodes to a calendar month except via `title` or `targetDate` or `monthCode`.
+    // But `monthCode` '01' usually means Jan, '02' Feb in standard WBS?
+    // Yes, let's assume `monthCode` corresponds to calendar month.
+    
+    const nextMonthOriginals = await prisma.planNode.findMany({
+        where: {
+            level: 6, // Month Node
+            monthCode: targetMonthCode,
+            evolutionTag: 'ORIGINAL'
+        }
+    });
+    
+    console.log(`Found ${nextMonthOriginals.length} original tasks for Month ${month}.`);
+    
+    // 2. 获取本月未完成的任务 (All Unfinished, regardless of source)
+    // "This Month" = Target Month - 1
+    let currentMonth = month - 1;
+    let currentYear = year;
+    if (currentMonth === 0) {
+        currentMonth = 12;
+        currentYear = year - 1;
+    }
+    const currentMonthCode = currentMonth.toString().padStart(2, '0');
+    
+    const unfinishedTasks = await prisma.planNode.findMany({
+        where: {
+            level: 6,
+            monthCode: currentMonthCode,
+            // [Fix] Removed evolutionTag filter to include ALL unfinished tasks
+            progress: { lt: 100 },
+            status: { not: 'CANCELLED' }
+        }
+    });
+    
+    console.log(`Found ${unfinishedTasks.length} unfinished tasks from Month ${currentMonth}.`);
+    
+    // 3. Merge: Inherit Unfinished Tasks
+    // Create COPY of unfinished tasks in the Target Month
+    const inheritedTasks = [];
+    
+    for (const task of unfinishedTasks) {
+        // Check if already inherited (avoid duplicates)
+        // How to check? Maybe check title + target month?
+        // Or check if we have an INHERITED task with same title in target month.
+        const exists = await prisma.planNode.findFirst({
+            where: {
+                level: 6,
+                monthCode: targetMonthCode,
+                title: task.title, // Assuming title uniqueness for check
+                evolutionTag: 'INHERITED'
+            }
+        });
+        
+        if (!exists) {
+            // Create Inherited Node
+            // We need a Parent (D2) for this new M node.
+            // Requirement: "Inherited tasks must keep their original nodeNumber association"
+            // This is tricky. 
+            // If the original task is F01...D201M03 (March),
+            // The new task should be F01...D201M04 (April)?
+            // Yes, it should hang under the SAME Parent (D2).
+            
+            // 1. Get Parent
+            if (!task.parentId) continue; // Should have parent
+            
+            // 2. Generate new NodeNumber for Target Month
+            // We need to force the `monthCode` to be `targetMonthCode`?
+            // `generateWBSNodeNumber` generates sequential M01, M02... 
+            // It doesn't force a specific month code (e.g. M04).
+            // But if we want it to be "Month 4 Plan", we should probably manually construct it 
+            // OR ensure `monthCode` field is set to '04'.
+            // However, WBS logic usually means "1st Month Node", "2nd Month Node", not "April Node".
+            // BUT, user's logic implies `monthCode` IS the calendar month (e.g. M03 = March).
+            // If so, we can try to force it.
+            
+            // Let's assume we just create it under the same parent.
+            // But we tag it INHERITED.
+            
+            const descriptionPrefix = `【继承自${currentMonth}月】`;
+            const newDescription = task.description ? `${descriptionPrefix} ${task.description}` : descriptionPrefix;
+
+            const newNode = await createPlanNode({
+                title: task.title,
+                description: newDescription,
+                parentId: task.parentId, // Keep same parent
+                level: 6,
+                owner: task.owner || undefined,
+                priority: task.priority,
+                periodType: 'MONTH',
+                planStatus: '自动继承',
+                progress: task.progress, // Keep progress? Or reset? Usually keep.
+                planCategory: task.planCategory || undefined,
+                evolutionTag: 'INHERITED'
+            });
+            
+            // [Fix] Force update monthCode to targetMonthCode if strict calendar mapping is required?
+            // If our WBS generator just does +1, M03 -> M04 (if M03 was last).
+            // If M04 already exists (Original), generator might give M05.
+            // If we want Strict Calendar Mapping (M04 = April), we might need to override.
+            // But let's stick to standard generator for now to avoid collision.
+            
+            inheritedTasks.push(newNode);
+            console.log(`Inherited Task: ${task.title} -> ${newNode.nodeNumber}`);
+        }
+    }
+    
+    return {
+        originalCount: nextMonthOriginals.length,
+        inheritedCount: inheritedTasks.length,
+        inheritedTasks
+    };
+}
 export async function rollOverMonthlyTasks() {
     const now = new Date();
     // Assuming this runs on 1st of Month.

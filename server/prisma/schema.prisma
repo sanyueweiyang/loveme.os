@@ -35,14 +35,38 @@ model PlanNode {
   planStatus     String?   // 计划状态 (e.g. '上线', '提测')
   periodType     String?   // 'YEAR' | 'MONTH' | 'WEEK'
   
+  // [New] 7层基因编码 (WBS DNA)
+  planCategoryCode String? // L1: F-分类 (e.g. 01)
+  objectiveCode    String? // L2: O-目标 (e.g. 01)
+  krCode           String? // L3: KR-关键结果 (e.g. 01)
+  detail1Code      String? // L4: D1-拆解一层 (e.g. 01)
+  detail2Code      String? // L5: D2-拆解二层 (e.g. 01)
+  monthCode        String? // L6: M-月度 (e.g. 01)
+  weekCode         String? // L7: W-周度 (e.g. 01)
+
+  // [New] 逻辑编码与分类
+  nodeNumber     String?   @unique // 逻辑编码 (e.g. F01O01KR01D101D201M01W01)
+  planCategory   String?   // 分类 (e.g. '工作', '生活') - 对应 planCategoryCode
+  
+  // 执行复盘字段 (Execution & Review)
+  targetDate     DateTime? // 目标日期 (替代 plannedEndDate 的 String 类型?) 
+  
   progress       Float     @default(0) // 0-100
   status         String    @default("PLANNED") // Enum: PLANNED, IN_PROGRESS, COMPLETED, PAUSED, CANCELLED
-  outputContent  String?   // 产出内容
+  // outputContent 已合并至 dataFeedback，如需保留请确认用途。
+  // 用户指示: "保留 description 作为任务描述，但请确认 dataFeedback 才是执行结果的核心存放地。如果 outputContent 没用，请合并或删除"
+  // 决策: 删除 outputContent，统一使用 dataFeedback
   
   // [New] Reporting Fields
-  dataFeedback   String?   // 数据情况
+  dataFeedback   String?   // 执行结果/数据反馈 (Core Output)
   issueLog       String?   // 问题反馈
   
+  // [New] Management Audit
+  evolutionTag   String?   // 'ORIGINAL', 'PLAN_OUTSIDE', 'STRATEGY_ADJUST', 'INHERITED'
+  
+  // [New] Schedule Linkage
+  scheduleNodes  ScheduleNode[]
+
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
   
@@ -52,21 +76,53 @@ model PlanNode {
   @@index([status])
 }
 
-// enum Priority {
-//   P0
-//   P1
-//   P2
-//   P3
-//   P4
-// }
+// ... (Existing Enums)
 
-// enum NodeStatus {
-//   PLANNED
-//   IN_PROGRESS
-//   COMPLETED
-//   PAUSED
-//   CANCELLED
-// }
+// [New] 日程节点 (Time Slots)
+model ScheduleNode {
+  id            Int       @id @default(autoincrement())
+  date          String    // YYYY-MM-DD
+  startTime     String    // HH:mm (e.g. "09:00")
+  endTime       String    // HH:mm (e.g. "09:30")
+  
+  // Linkage
+  relatedPlanId Int?
+  relatedPlan   PlanNode? @relation(fields: [relatedPlanId], references: [id])
+  
+  // Content
+  title         String?   // Optional snapshot or ad-hoc task
+  remark        String?   // Process record / 备注
+  category      String?   // [New] Manual Category (e.g. '工作', '生活') for AI Audit
+  
+  // Layout
+  isMerged      Boolean   @default(false)
+  span          Int       @default(1) // Number of 30-min slots
+  
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([date])
+  @@index([relatedPlanId])
+}
+
+// [New] 每日概览 (Daily View & AI Audit)
+model DailySummary {
+  id            Int       @id @default(autoincrement())
+  date          String    @unique // YYYY-MM-DD
+  
+  // Part 1: Intention
+  mit           String?   // Most Important Thing (每日核心目标)
+  
+  // Part 2: Reality (AI Generated)
+  aiSummary     String?   // "今天忙了些啥"
+  
+  // Part 3: Audit (AI Generated)
+  aiAudit       String?   // "知行合一评价"
+  score         Int?      // 评分
+  
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
 
 // 每日工作日志 (用于工时计算)
 model WorkLog {

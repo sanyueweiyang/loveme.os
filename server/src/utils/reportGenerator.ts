@@ -2,9 +2,22 @@
 import { PlanNode } from '@prisma/client';
 
 /**
- * Weekly Report Generator
- * Strictly follows the formula:
- * [序号]、[项目标题]：[上线时间][planStatus]。内容：[描述]。【进度：[XX]%，[状态]】【优先级：[PX]】-[负责人]
+ * 生成每日简报 (Context Briefing for AI)
+ * 汇总当前年度/月度/周度的关键节点
+ */
+export async function generateDayReport(date: Date = new Date()) {
+    // We need prisma access here. Usually utils are pure functions.
+    // Refactor: Move this logic to a Service or pass data in.
+    // For now, let's keep it simple and just export a helper string formatter, 
+    // and do data fetching in the Service/Controller.
+    // Wait, the requirement says "Implement GET /api/context/daily-briefing".
+    // So let's implement the logic in `planService.ts` or `scheduleService.ts` and expose it.
+    // This file is for "Copy Generation" (String formatting).
+    return "Use getDailyContext() in planService instead.";
+}
+
+/**
+ * 周报文案生成器 (Copywriter)
  */
 export function generateWeeklyReportCopy(node: any, index: number): string {
   // 1. [序号]

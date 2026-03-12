@@ -1,0 +1,14 @@
+{
+  "build": {
+    "command": "npm run build",
+    "outputDirectory": "dist"
+  },
+  "server": {
+    "command": "npm start"
+  },
+  "persistence": {
+    "/server/prisma": {
+      "type": "volume"
+    }
+  }
+}

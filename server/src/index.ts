@@ -1,7 +1,10 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { PrismaClient } from '@prisma/client';
+import prisma from './lib/prisma'; // Use singleton
+
+// [Deploy] Force Timezone
+process.env.TZ = 'Asia/Shanghai';
 
 dotenv.config();
 
@@ -13,20 +16,56 @@ import {
   updatePlanNode, 
   deletePlanNode, 
   getWeeklyReportNodes,
+  getClaimableTasks,
+  claimTasksToWeeklyReport,
+  initializeNextWeekReport,
+  getCategorizedReport,
   claimTask,
   savePushHistory,
-  getPushHistory
+  getPushHistory,
+  getDailyContext,
+  recalculateAllProgress
 } from './services/planService';
-import { generateWeeklyReportCopy } from './utils/reportGenerator';
-
-dotenv.config();
+import { 
+  getDailySchedule, 
+  saveDailySchedule, 
+  getWeeklyScheduleStats, 
+  triggerDailyAIAudit, 
+  getCalendarViewData 
+} from './services/scheduleService';
+import { interpretSchedule, generateDailyAudit } from './services/aiService';
+import { generateWeeklyReportCopy, generateDayReport } from './utils/reportGenerator';
 
 const app = express();
-const prisma = new PrismaClient();
+// const prisma = new PrismaClient(); // Removed
 const port = process.env.PORT || 3000;
 
-// 1. CORS Configuration (Allow All)
-app.use(cors({ origin: '*' }));
+// 1. CORS Configuration (Allow *.lovable.app & localhost)
+const allowedOrigins = [
+  /\.lovable\.app$/,
+  /^http:\/\/localhost:\d+$/,
+  /^http:\/\/127\.0\.0\.1:\d+$/
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    // 生产环境安全策略：允许 *.lovable.app 及本地调试
+    const isAllowed = allowedOrigins.some(pattern => pattern.test(origin));
+    
+    if (isAllowed) {
+      return callback(null, true);
+    }
+    
+    // [Zeabur Deployment] 
+    // 为了防止部署初期因 CORS 配置错误导致前端无法访问，暂时放行所有请求。
+    // 待前端域名确定后，建议将下方改为 return callback(new Error('Not allowed by CORS'));
+    return callback(null, true); 
+  },
+  credentials: true
+}));
 app.use(express.json());
 
 // --- Helper Functions ---
@@ -114,18 +153,11 @@ async function pushToWeChat(content: string): Promise<boolean> {
   }
 
   // 存档
-  try {
-    await prisma.pushHistory.create({
-      data: {
-        content,
-        status: 'PENDING',
-        platform: 'WECHAT'
-      }
-    });
-  } catch (e) {
-    console.error('Archive failed', e);
-  }
-
+  // Note: We move the persistence logic to the caller (route handler) 
+  // to ensure snapshotData is captured correctly.
+  // We keep a simple log here if needed, but 'savePushHistory' is better.
+  // Or we just return success/fail and let caller handle history.
+  
   const url = `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${key}`;
   
   try {
@@ -157,28 +189,6 @@ async function pushToWeChat(content: string): Promise<boolean> {
   }
 }
 
-async function updateParentProgressRecursive(parentId: number) {
-  const parent = await prisma.planNode.findUnique({
-    where: { id: parentId },
-    include: { children: true }
-  });
-
-  if (!parent || parent.children.length === 0) return;
-
-  const totalProgress = parent.children.reduce((sum, child) => sum + child.progress, 0);
-  const averageProgress = parseFloat((totalProgress / parent.children.length).toFixed(2));
-
-  if (parent.progress !== averageProgress) {
-    await prisma.planNode.update({
-      where: { id: parentId },
-      data: { progress: averageProgress },
-    });
-    
-    if (parent.parentId) {
-      await updateParentProgressRecursive(parent.parentId);
-    }
-  }
-}
 
 // --- Routes ---
 
@@ -198,8 +208,8 @@ app.get('/api/nodes/tree', async (req, res) => {
 app.get('/api/logs', async (req, res) => {
   try {
     const logs = await prisma.workLog.findMany({
-      orderBy: { date: 'desc' },
-      include: { relatedNode: { select: { title: true } } }
+      orderBy: { createdAt: 'desc' },
+      // include: { relatedNode: { select: { title: true } } }
     });
     res.json(logs);
   } catch (error) {
@@ -211,15 +221,13 @@ app.get('/api/logs', async (req, res) => {
 // Create Log
 app.post('/api/logs', async (req, res) => {
   try {
-    const { content, date, relatedNodeId, startTime, endTime, duration } = req.body;
+    const { content, relatedNodeId, startTime, endTime } = req.body;
     const newLog = await prisma.workLog.create({
       data: {
         content,
-        date: date ? new Date(date) : new Date(),
         relatedNodeId: relatedNodeId || null,
         startTime: startTime ? new Date(startTime) : null,
         endTime: endTime ? new Date(endTime) : null,
-        duration: duration ? parseInt(duration) : null,
       }
     });
     res.json(newLog);
@@ -233,16 +241,14 @@ app.post('/api/logs', async (req, res) => {
 app.put('/api/logs/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    const { content, date, relatedNodeId, startTime, endTime, duration } = req.body;
+    const { content, relatedNodeId, startTime, endTime } = req.body;
     const updatedLog = await prisma.workLog.update({
       where: { id },
       data: {
         content,
-        date: date ? new Date(date) : undefined,
         relatedNodeId: relatedNodeId || null,
         startTime: startTime ? new Date(startTime) : undefined,
         endTime: endTime ? new Date(endTime) : undefined,
-        duration: duration ? parseInt(duration) : undefined,
       }
     });
     res.json(updatedLog);
@@ -272,11 +278,11 @@ app.get('/api/reports/weekly', async (req, res) => {
       where: {
         level: { in: [5, 6] },
         actualEndDate: { gte: startDate, lte: endDate },
-        outputContent: { not: null }
+        dataFeedback: { not: null }
       },
       select: {
         title: true,
-        outputContent: true,
+        dataFeedback: true,
         actualEndDate: true,
         priority: true,
         owner: true
@@ -284,8 +290,8 @@ app.get('/api/reports/weekly', async (req, res) => {
     });
     
     const recentLogs = await prisma.workLog.findMany({
-        where: { date: { gte: startDate, lte: endDate } },
-        include: { relatedNode: { select: { title: true } } }
+        where: { createdAt: { gte: startDate, lte: endDate } },
+        // include: { relatedNode: { select: { title: true } } }
     });
 
     res.json({
@@ -300,27 +306,81 @@ app.get('/api/reports/weekly', async (req, res) => {
   }
 });
 
+// 5. 周报认领 (GET /api/plans/claimable)
+app.get('/api/plans/claimable', async (req, res) => {
+    try {
+        const year = parseInt(req.query.year as string) || new Date().getFullYear();
+        const month = parseInt(req.query.month as string) || (new Date().getMonth() + 1);
+        
+        const tasks = await getClaimableTasks(year, month);
+        res.json(tasks);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to fetch claimable tasks' });
+    }
+});
+
+// 7. 初始化下周周报 (POST /api/plans/init-week)
+app.post('/api/plans/init-week', async (req, res) => {
+    try {
+        const { weekCode } = req.body;
+        if (!weekCode) {
+            return res.status(400).json({ error: 'Missing weekCode' });
+        }
+        const result = await initializeNextWeekReport(weekCode);
+        res.json(result);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to initialize week' });
+    }
+});
+
+// 8. 获取分类汇总报表 (GET /api/reports/categorized)
+app.get('/api/reports/categorized', async (req, res) => {
+    try {
+        const period = (req.query.period as 'MONTH' | 'YEAR') || 'MONTH';
+        const year = req.query.year ? parseInt(req.query.year as string) : new Date().getFullYear();
+        const month = req.query.month ? parseInt(req.query.month as string) - 1 : new Date().getMonth();
+        
+        // Construct date for getPeriodicReportNodes
+        // If MONTH, we need a date within that month.
+        // If YEAR, any date in that year.
+        const date = new Date(year, month, 15);
+        
+        const report = await getCategorizedReport(period, date);
+        res.json(report);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to generate report' });
+    }
+});
+
+// 6. 批量认领执行 (POST /api/plans/claim-batch)
+app.post('/api/plans/claim-batch', async (req, res) => {
+    try {
+        const { taskIds, weekCode, owner } = req.body;
+        
+        if (!taskIds || !Array.isArray(taskIds) || !weekCode) {
+            return res.status(400).json({ error: 'Missing required parameters: taskIds (array), weekCode' });
+        }
+
+        const results = await claimTasksToWeeklyReport(taskIds, weekCode, owner);
+        res.json(results);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to claim tasks' });
+    }
+});
+
 // 4. 节点更新 (PATCH /api/nodes/:id) - Supports progress recursion
 app.patch('/api/nodes/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     const data = req.body;
     
-    if (data.progress !== undefined) {
-        const updatedNode = await prisma.planNode.update({
-            where: { id },
-            data: { progress: data.progress },
-            include: { parent: true }
-        });
-        
-        if (updatedNode.parentId) {
-            await updateParentProgressRecursive(updatedNode.parentId);
-        }
-        res.json(updatedNode);
-    } else {
-        const updated = await prisma.planNode.update({ where: { id }, data });
-        res.json(updated);
-    }
+    // updatePlanNode now handles progress recursion internally
+    const updatedNode = await updatePlanNode(id, data);
+    res.json(updatedNode);
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to update node' });
@@ -389,7 +449,7 @@ app.post('/api/nodes', async (req, res) => {
         priority: inheritedPriority,
         planStatus: inheritedPlanStatus, // 继承状态
         periodType: data.periodType,
-        outputContent: data.outputContent,
+        dataFeedback: data.dataFeedback || data.outputContent, // Fix: outputContent removed
         plannedEndDate: data.plannedEndDate,
         rootId,
       }
@@ -418,9 +478,11 @@ app.put('/api/nodes/:id', async (req, res) => {
 app.delete('/api/nodes/:id', async (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    await prisma.planNode.delete({ where: { id } });
+    await deletePlanNode(id);
     res.json({ success: true });
-  } catch (error) { res.status(500).json({ error: 'Failed to delete node' }); }
+  } catch (error: any) { 
+    res.status(500).json({ error: error.message || 'Failed to delete node' }); 
+  }
 });
 
 // --- Enterprise WeChat Integration ---
@@ -437,7 +499,14 @@ app.post('/api/wechat/push', async (req, res) => {
     const success = await pushToWeChat(markdown);
     
     // 存档
-    await savePushHistory(markdown, success ? 'SUCCESS' : 'FAILED', 'WECHAT');
+    await savePushHistory(
+      markdown, 
+      success ? 'SUCCESS' : 'FAILED', 
+      'WECHAT',
+      'WEEK', // Default to WEEK for manual trigger?
+      'Manual-Trigger',
+      JSON.stringify(nodes)
+    );
 
     if (success) {
       res.json({ success: true, message: '已推送到企业微信' });
@@ -449,6 +518,15 @@ app.post('/api/wechat/push', async (req, res) => {
     res.status(500).json({ error: 'Failed to push message' });
   }
 });
+
+// Helper for Week Number
+function getWeekNumber(d: Date) {
+    d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+    d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay()||7));
+    var yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+    var weekNo = Math.ceil(( ( (d.getTime() - yearStart.getTime()) / 86400000) + 1)/7);
+    return weekNo;
+}
 
 // 2. Receive Callback from WeChat Robot (Outgoing Webhook)
 app.post('/api/wechat/callback', async (req, res) => {
@@ -526,6 +604,142 @@ app.get('/api/debug/simulate-report', async (req, res) => {
     console.error(error);
     res.status(500).send('Simulation Failed');
   }
+});
+
+// --- Schedule Management (Tab 4) ---
+
+// 1. Get Daily Schedule
+app.get('/api/schedule/:date', async (req, res) => {
+    try {
+        const { date } = req.params; // YYYY-MM-DD
+        const data = await getDailySchedule(date);
+        res.json(data);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to fetch schedule' });
+    }
+});
+
+// 2. Save Daily Schedule (Auto-Save / Silent Save)
+app.post('/api/schedule', async (req, res) => {
+    try {
+        const { date, mit, nodes } = req.body;
+        const dryRun = req.query.dryRun === 'true'; // [New] Parse dryRun param
+        
+        if (!date || !nodes) {
+            return res.status(400).json({ error: 'Missing date or nodes' });
+        }
+        
+        const result = await saveDailySchedule(date, { mit, nodes }, dryRun);
+        
+        // If dryRun, return result directly (preview)
+        if (dryRun) {
+             res.json(result);
+        } else {
+             res.json({ success: true });
+        }
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to save schedule' });
+    }
+});
+
+// 3. Weekly Stats (For Weekly View)
+app.get('/api/schedule/weekly-stats', async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        if (!startDate || !endDate) {
+            return res.status(400).json({ error: 'Missing date range' });
+        }
+        const stats = await getWeeklyScheduleStats(startDate as string, endDate as string);
+        res.json(stats);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to fetch stats' });
+    }
+});
+
+// 4. Trigger AI Audit
+app.post('/api/schedule/ai-audit', async (req, res) => {
+    try {
+        const { date } = req.body;
+        const result = await triggerDailyAIAudit(date);
+        res.json(result);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to trigger AI audit' });
+    }
+});
+
+// 5. Calendar View Data (Year/Month)
+app.get('/api/schedule/calendar-view', async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        if (!startDate || !endDate) {
+            return res.status(400).json({ error: 'Missing date range' });
+        }
+        const data = await getCalendarViewData(startDate as string, endDate as string);
+        res.json(data);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to fetch calendar data' });
+    }
+});
+
+// 6. AI Schedule Interpreter
+app.post('/api/ai/interpret', async (req, res) => {
+    try {
+        const { text, dateContext } = req.body;
+        if (!text) {
+            return res.status(400).json({ error: 'Missing text input' });
+        }
+        const result = await interpretSchedule(text, dateContext);
+        res.json(result);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to interpret schedule' });
+    }
+});
+
+// 7. Context Briefing (Data Dehydration)
+app.get('/api/context/daily-briefing', async (req, res) => {
+    try {
+        const context = await getDailyContext();
+        res.json(context);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to generate briefing' });
+    }
+});
+
+// 8. Daily Audit (GET /api/audit/daily)
+app.get('/api/audit/daily', async (req, res) => {
+    try {
+        const { date } = req.query;
+        if (!date) {
+            return res.status(400).json({ error: 'Missing date parameter' });
+        }
+        
+        const result = await generateDailyAudit(date as string);
+        if (result.error) {
+            return res.status(404).json(result);
+        }
+        res.json(result);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to generate audit' });
+    }
+});
+
+// 9. Recalculate All Progress (Admin Tool)
+app.get('/api/admin/recalc-all', async (req, res) => {
+    try {
+        const result = await recalculateAllProgress();
+        res.json(result);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: 'Failed to recalculate progress' });
+    }
 });
 
 app.get('/', (req, res) => {
