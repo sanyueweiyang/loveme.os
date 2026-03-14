@@ -1,24 +1,10 @@
-# Use Node.js LTS (Alpine) for a small and secure base image
-FROM node:20-alpine
-
-# Set working directory
+FROM node:20-slim
+RUN apt-get update -y && apt-get install -y openssl
 WORKDIR /app
-
-# Copy package files first to leverage Docker cache
+# 注意：如果 Dockerfile 在 server 文件夹内，路径就要写成 ./package*.json
 COPY package*.json ./
-
-# Install all dependencies (including devDependencies for build tools)
 RUN npm install
-
-# Copy the rest of the application code
 COPY . .
-
-# Build the TypeScript code and generate Prisma Client
-# This runs: tsc && prisma generate
-RUN npm run build
-
-# Expose the application port
+RUN npx prisma generate
 EXPOSE 3000
-
-# Start the server
-CMD ["npm", "start"]
+CMD ["npm", "run", "start"]
