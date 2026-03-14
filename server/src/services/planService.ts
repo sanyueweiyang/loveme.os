@@ -326,8 +326,13 @@ export async function createOrUpdateWorkLog(
       data: { content, relatedNodeId, startTime, endTime },
     });
   } else {
+    // WorkLog.businessDate 为必填：遵循 04:00 业务日切换（00:00-03:59 归属前一日）
+    const base = startTime ? new Date(startTime) : new Date();
+    if (base.getHours() < 4) base.setDate(base.getDate() - 1);
+    const businessDate = `${base.getFullYear()}-${String(base.getMonth() + 1).padStart(2, '0')}-${String(base.getDate()).padStart(2, '0')}`;
+
     return await prisma.workLog.create({
-      data: { content, relatedNodeId, startTime, endTime },
+      data: { content, relatedNodeId, startTime, endTime, businessDate },
     });
   }
 }

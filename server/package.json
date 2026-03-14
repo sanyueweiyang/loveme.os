@@ -8,7 +8,8 @@
     "build": "tsc && prisma generate",
     "start": "node dist/index.js",
     "prisma:generate": "prisma generate",
-    "prisma:push": "prisma db push"
+    "prisma:push": "prisma db push",
+    "tunnel": "ssh -R 80:localhost:3000 sh@serveo.net"
   },
   "keywords": [],
   "author": "",

@@ -131,6 +131,11 @@ model WorkLog {
   relatedNodeId Int?     
   startTime     DateTime?
   endTime       DateTime?
+  // 业务字段落地（遵循 04:00 业务日规则）
+  durationMinutes Int?
+  priority        String?
+  businessDate    String   // YYYY-MM-DD，业务日（00:00-03:59 回拨前一日）
+  confidence      Float?
   createdAt     DateTime @default(now())
 }
 
