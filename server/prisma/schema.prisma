@@ -4,7 +4,9 @@ generator client {
 
 datasource db {
   provider = "sqlite"
-  url      = env("DATABASE_URL")
+  // 固定为相对于 server 根目录的 dev.db，限制连接数为 1 并设置超时时间，降低 SQLite 锁冲突概率
+  // 对 SQLite 来说，这里的 query 参数会作为文件 URI 传递，Prisma 会忽略未知参数，但仍保持兼容
+  url      = "file:./prisma/dev.db?connection_limit=1&socket_timeout=10000"
 }
 
 model User {
@@ -59,13 +61,22 @@ model PlanNode {
   
   // [New] Reporting Fields
   dataFeedback   String?   // 执行结果/数据反馈 (Core Output)
-  issueLog       String?   // 问题反馈
-  
+  issueLog       String?   // 问题记录（障碍/风险/复盘）
+
+  // [New] 执行工时
+  actualHours    Float?    // 实际工时（小时），L6 录入，上层汇总
+
   // [New] Management Audit
   evolutionTag   String?   // 'ORIGINAL', 'PLAN_OUTSIDE', 'STRATEGY_ADJUST', 'INHERITED'
   
   // [New] Schedule Linkage
   scheduleNodes  ScheduleNode[]
+
+  // [New] DailyTask 关联
+  dailyTasks     DailyTask[]
+
+  // [New] DailySchedule 关联
+  dailySchedules DailySchedule[] @relation("DailySchedulePlanNode")
 
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
@@ -154,4 +165,162 @@ model PushHistory {
   createdAt    DateTime @default(now())
   
   @@index([reportType, reportPeriod])
+}
+
+/// LoveMe OS — 通用 WBS 节点模型（七层）
+model WBSNode {
+  id         Int       @id @default(autoincrement())
+  name       String
+  level      Int       // 1-7, 对应 WBS 七层
+
+  /// 逻辑编号，例如：L1-01, L4-02-01
+  nodeNumber String    @unique
+
+  /// 自引用形成树结构
+  parentId   Int?
+  parent     WBSNode?  @relation("WBSParentChild", fields: [parentId], references: [id])
+  children   WBSNode[] @relation("WBSParentChild")
+
+  /// 关联执行层任务/活动
+  activities Activity[]
+
+  /// 进度（0-100）
+  progress   Float     @default(0)
+
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([level])
+  @@index([parentId])
+  @@index([nodeNumber])
+  @@index([progress])
+}
+
+/// 执行层任务 / 活动（挂在某个 WBS 节点下）
+model Activity {
+  id          Int      @id @default(autoincrement())
+
+  /// 任务名称（语义解析得到的 taskName）
+  title       String?
+
+  /// 所属 WBS 节点（通常是 L5/L6/L7）
+  wbsNodeId   Int
+  wbsNode     WBSNode  @relation(fields: [wbsNodeId], references: [id])
+
+  /// 是否为计划内任务（精力哨兵逻辑）
+  isPlanned   Boolean  @default(true)
+
+  /// 计划时间
+  plannedStart DateTime?
+  plannedEnd   DateTime?
+
+  /// 实际发生时间
+  actualStart  DateTime?
+  actualEnd    DateTime?
+
+  /// 预估时长（分钟）
+  durationMinutes Int? @default(0)
+
+  /// 业务日（遵循 04:00 业务日规则），格式：YYYY-MM-DD
+  businessDate String?
+
+  /// 状态：进行中、已完成、风险 等（使用字符串，后续可迁移为 Enum）
+  status      String   @default("PLANNED")
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([wbsNodeId])
+  @@index([status])
+  @@index([businessDate])
+}
+
+// ── 每日执行任务（关联 PlanNode，记录具体时间段与维度）──────────────
+model DailyTask {
+  id          Int       @id @default(autoincrement())
+
+  /// 关联的 PlanNode（通常是 L6 执行节点）
+  planNodeId  Int
+  planNode    PlanNode  @relation(fields: [planNodeId], references: [id])
+
+  /// 业务日期，格式 YYYY-MM-DD
+  date        String
+
+  /// 开始时间，格式 HH:mm
+  startTime   String?
+
+  /// 结束时间，格式 HH:mm
+  endTime     String?
+
+  /// 实际工时（小时），可由 startTime/endTime 计算或手动录入
+  actualHours Float?
+
+  /// 工作维度：'工作' | '生活' | '成长'
+  dimension   String?
+
+  /// 执行备注 / 产出
+  remark      String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([planNodeId])
+  @@index([date])
+}
+
+// ── 每日日程安排（时间块，可关联 PlanNode）────────────────────────────
+model DailySchedule {
+  id          Int       @id @default(autoincrement())
+
+  /// 业务日期，格式 YYYY-MM-DD
+  date        String
+
+  /// 开始时间，格式 HH:mm（如 "09:00"）
+  startTime   String
+
+  /// 结束时间，格式 HH:mm（如 "09:30"）
+  endTime     String
+
+  /// 任务名称（可独立填写，也可从关联节点继承）
+  taskName    String?
+
+  /// 关联的 PlanNode（可选，关联后可追溯到 WBS 层级）
+  nodeId      Int?
+  planNode    PlanNode? @relation("DailySchedulePlanNode", fields: [nodeId], references: [id])
+
+  /// 工作维度：'工作' | '生活' | '成长'
+  dimension   String?
+
+  /// 备注
+  remark      String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([date])
+  @@index([nodeId])
+}
+
+// ── 审计报告（AI 生成的周/月/年总结）────────────────────────────────
+model AuditReport {
+  id          Int      @id @default(autoincrement())
+
+  /// 报告类型：'WEEK' | 'MONTH' | 'YEAR'
+  reportType  String
+
+  /// 周期编码，例如 '2026-W11'、'2026-03'、'2026'
+  periodCode  String
+
+  /// AI 生成的总结内容（Markdown）
+  content     String
+
+  /// 报告生成时的原始数据快照（JSON 字符串，可选）
+  snapshotData String?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([reportType, periodCode])
+  @@index([reportType])
+  @@index([periodCode])
 }

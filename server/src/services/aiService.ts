@@ -6,6 +6,27 @@ const prisma = new PrismaClient();
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions'; // Adjust based on actual endpoint
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 
+// OpenAI SDK Client (用于任务解析 & DeepSeek 兼容 API)
+// 注意：
+// - OPENAI_API_KEY：你的 DeepSeek/OpenAI Key
+// - OPENAI_BASE_URL：DeepSeek 的兼容网关，如 https://api.deepseek.com/v1
+// 这里使用 require 以兼容 CommonJS 构建配置。
+// 为了在本地未配置 Key 时不阻塞整个服务，我们只在实际需要调用时再懒加载客户端。
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const OpenAI = require('openai');
+type OpenAIClient = typeof import('openai');
+
+function createOpenAIClient() {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY is missing');
+  }
+  const client: InstanceType<OpenAIClient['OpenAI']> = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+    baseURL: process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+  });
+  return client;
+}
+
 interface ScheduleInterpretation {
     date: string;       // YYYY-MM-DD
     startTime: string;  // HH:mm
@@ -14,6 +35,100 @@ interface ScheduleInterpretation {
     remark: string;     // Detailed Remark
     keywords: string[]; // Keywords for matching PlanNode
     category: string;   // '工作' | '生活' | '学习'
+}
+
+// -------- 任务解析：POST /api/parse-task 使用的类型 --------
+
+export interface ParsedTaskResult {
+  taskName: string;
+  startTime: string;      // ISO 8601
+  endTime: string;        // ISO 8601
+  durationMinutes: number;
+  suggestedNodeId: string | null; // 这里用 L1-L7 表示建议挂载层级
+}
+
+/**
+ * 使用 OpenAI 将自然语言解析为结构化任务
+ * - 支持「刚才 / 明天」等相对时间（相对 now 参数，默认当前时间 & 上海时区）
+ * - 返回标准 JSON：taskName, startTime, endTime, durationMinutes, suggestedNodeId
+ */
+export async function parseTaskWithAI(text: string, now?: string): Promise<ParsedTaskResult> {
+  const nowDate = now ? new Date(now) : new Date();
+  const nowISO = nowDate.toISOString();
+
+  // 无 OPENAI_API_KEY 时的兜底逻辑：简单 mock，保证接口可用
+  if (!process.env.OPENAI_API_KEY) {
+    const end = nowDate;
+    const start = new Date(end.getTime() - 30 * 60 * 1000); // 默认 30 分钟
+    return {
+      taskName: text.slice(0, 20) || '未命名任务',
+      startTime: start.toISOString(),
+      endTime: end.toISOString(),
+      durationMinutes: 30,
+      suggestedNodeId: 'L6',
+    };
+  }
+
+  const systemPrompt = `
+你是一名「精力管理专家」，专门帮用户把自然语言工作记录，解析成结构化任务。
+
+【时间规则】
+1. 你收到的 now 字段是当前时间（ISO 字符串），默认为上海时区（Asia/Shanghai）。
+2. 用户会说「刚才」「刚刚」「刚搞完」「一会儿」「明天早上」等相对时间。
+3. 你需要将相对时间全部换算成绝对时间，返回 ISO 8601 字符串（例如 2026-03-14T09:30:00+08:00）。
+4. 如果只说「刚才做完」，可以默认持续 30 分钟：endTime=now，startTime=now-30min。
+5. 如果说「明天」「下周一」等，将日期偏移后，时间可以根据语境估计（如「早上」=09:00，「下午」=14:00，「晚上」=20:00）。
+
+【任务字段】
+请从用户输入中提取：
+- taskName：任务名称，简短有力，<= 20 个汉字。
+- startTime：任务开始时间（绝对时间，ISO 8601）。
+- endTime：任务结束时间（绝对时间，ISO 8601），需 >= startTime。
+- durationMinutes：预估时长，整数分钟。
+- suggestedNodeId：建议挂载的 WBS 层级，用 "L1" ~ "L7" 表示：
+  - L1/L2：高层战略或年度主题
+  - L3：项目集/大项目
+  - L4：模块/里程碑
+  - L5：工作包（可交付物）
+  - L6：具体活动（执行动作）
+  - L7：日志/流水记录
+一般个人日常的离散执行任务，默认推荐 L6。
+
+【输出格式】
+1. 严格输出 JSON 对象，不要包含任何多余文字。
+2. 字段必须是：taskName, startTime, endTime, durationMinutes, suggestedNodeId。
+  `.trim();
+
+  const userContent = `
+now: ${nowISO}
+text: ${text}
+`.trim();
+
+  const client = createOpenAIClient();
+
+  const completion = await client.chat.completions.create({
+    model: 'deepseek-chat',
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent },
+    ],
+    temperature: 0.2,
+  });
+
+  const raw = completion.choices[0]?.message?.content || '{}';
+  const jsonStr = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+  const parsed = JSON.parse(jsonStr);
+
+  return {
+    taskName: parsed.taskName ?? (text.slice(0, 20) || '未命名任务'),
+    startTime: parsed.startTime ?? nowISO,
+    endTime: parsed.endTime ?? nowISO,
+    durationMinutes: Number.isFinite(parsed.durationMinutes)
+      ? Number(parsed.durationMinutes)
+      : 30,
+    suggestedNodeId: typeof parsed.suggestedNodeId === 'string' ? parsed.suggestedNodeId : 'L6',
+  };
 }
 
 /**

@@ -4,10 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "concurrently \"npm run server\" \"npm run client\"",
-    "client": "npm run dev --prefix client",
+    "dev": "npm run server",
     "server": "npm run dev --prefix server",
-    "install:all": "npm install && npm install --prefix client && npm install --prefix server"
+    "install:all": "npm install && npm install --prefix server"
   },
   "repository": {
     "type": "git",
@@ -22,6 +21,8 @@
   },
   "homepage": "https://github.com/sanyueweiyang/loveme.os#readme",
   "devDependencies": {
-    "concurrently": "^9.2.1"
+    "concurrently": "^9.2.1",
+    "nodemon": "^3.1.14",
+    "ts-node": "^10.9.2"
   }
 }
