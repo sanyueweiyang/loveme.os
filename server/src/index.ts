@@ -71,9 +71,15 @@ interface TreeNode {
   progress: number;
   parentId: number | string | null;
   status?: string;
+  priority?: string | null;
   planCategory?: string | null;
+  description?: string | null;
   targetDate?: string | null;   // ISO 字符串，前端按需格式化
   dataFeedback?: string | null; // L6 专用
+  issueLog?: string | null;     // L6 专用
+  actualHours?: number | null;  // L6 专用
+  monthCode?: string | null;
+  weekCode?: string | null;
   children: TreeNode[];
 }
 
@@ -95,9 +101,15 @@ function buildTree(nodes: any[], parentId: number | null = null): TreeNode[] {
       progress: typeof node.progress === 'number' ? node.progress : 0,
       parentId: node.parentId ?? null,
       status: node.planStatus ?? node.status ?? 'PLANNED',
+      priority: node.priority ?? null,
       planCategory: node.planCategory ?? null,
+      description: node.description ?? null,
       targetDate: node.targetDate ? new Date(node.targetDate).toISOString().slice(0, 10) : null,
       dataFeedback: node.dataFeedback ?? null,
+      issueLog: node.issueLog ?? null,
+      actualHours: node.actualHours ?? null,
+      monthCode: node.monthCode ?? null,
+      weekCode: node.weekCode ?? null,
       children: buildTree(nodes, node.id),
     }));
 }
@@ -956,6 +968,67 @@ app.patch('/api/nodes/:id', async (req, res) => {
   }
 });
 
+// ── 节点编码自动生成工具函数 ──────────────────────────────────────────────────
+/**
+ * buildNodeNumber
+ * 根据父节点的编码字段，自动拼接当前节点的 nodeNumber。
+ *
+ * 编码规则（L1→L6）：
+ *   L1: F{planCategoryCode}
+ *   L2: F{..}O{objectiveCode}
+ *   L3: F{..}O{..}KR{krCode}
+ *   L4: F{..}O{..}KR{..}D1{detail1Code}
+ *   L5: F{..}O{..}KR{..}D1{..}D2{detail2Code}
+ *   L6: F{..}O{..}KR{..}D1{..}D2{..}W{weekCode}
+ *
+ * 若父节点编码不完整，则返回 null（不强制，避免阻塞创建）。
+ */
+async function buildNodeNumber(
+  level: number,
+  parentNode: any | null,
+  ownCode: string | null,
+): Promise<string | null> {
+  try {
+    /* 从父节点继承所有上层编码 */
+    const p = parentNode as any;
+    const f  = p?.planCategoryCode ?? null;
+    const o  = p?.objectiveCode    ?? null;
+    const kr = p?.krCode           ?? null;
+    const d1 = p?.detail1Code      ?? null;
+    const d2 = p?.detail2Code      ?? null;
+
+    const pad = (v: string | null) => v ? String(v).padStart(2, '0') : null;
+    const own = pad(ownCode);
+
+    if (level === 1) return own ? `F${own}` : null;
+    if (level === 2) return (f && own) ? `F${f}O${own}` : null;
+    if (level === 3) return (f && o && own) ? `F${f}O${o}KR${own}` : null;
+    if (level === 4) return (f && o && kr && own) ? `F${f}O${o}KR${kr}D1${own}` : null;
+    if (level === 5) return (f && o && kr && d1 && own) ? `F${f}O${o}KR${kr}D1${d1}D2${own}` : null;
+    if (level === 6) {
+      /* L6 用 weekCode 作为末段，ownCode 可为 null */
+      const wk = p?.weekCode ?? null;
+      return (f && o && kr && d1 && d2 && wk)
+        ? `F${f}O${o}KR${kr}D1${d1}D2${d2}W${wk}`
+        : null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * getNextSiblingCode
+ * 查询同一父节点下已有的同层节点数量，返回下一个序号（两位字符串，如 "03"）。
+ */
+async function getNextSiblingCode(parentId: number | null, level: number): Promise<string> {
+  const count = await prisma.planNode.count({
+    where: { parentId: parentId ?? undefined, level },
+  });
+  return String(count + 1).padStart(2, '0');
+}
+
 app.post('/api/nodes', async (req, res) => {
   try {
     const data = req.body;
@@ -991,8 +1064,8 @@ app.post('/api/nodes', async (req, res) => {
       });
     }
     const VALID_PLAN_CATEGORY = ['工作', '生活', '成长'];
-    const VALID_PRIORITY      = ['P1', 'P2', 'P3'];
-    const VALID_PLAN_STATUS   = ['PLANNED', 'IN_PROGRESS', 'DONE'];
+    const VALID_PRIORITY      = ['P0', 'P1', 'P2', 'P3', 'P4'];
+    const VALID_PLAN_STATUS   = ['PLANNED', 'IN_PROGRESS', 'IN_PROGRESS_CROSS_WEEK', 'DONE', 'DEFERRED', 'CANCELLED'];
 
     if (data.planCategory && !VALID_PLAN_CATEGORY.includes(data.planCategory)) {
       return res.status(400).json({ error: 'INVALID_PLAN_CATEGORY', message: `planCategory 必须是 ${VALID_PLAN_CATEGORY.join(' | ')}` });
@@ -1004,9 +1077,22 @@ app.post('/api/nodes', async (req, res) => {
       return res.status(400).json({ error: 'INVALID_PLAN_STATUS', message: `planStatus 必须是 ${VALID_PLAN_STATUS.join(' | ')}` });
     }
 
-    // ── planCategory 层级继承 ──────────────────────────────────────
+    // ── 三字段强制继承：category / owner / priority ────────────────
+    // 规则：前端若未传（null/undefined/空串），强制从父节点继承；L1 无父节点时使用兜底值
     const planCategory: string | null =
-      data.planCategory || (parentNode ? (parentNode as any).planCategory : null) || null;
+      (data.planCategory != null && data.planCategory !== '')
+        ? data.planCategory
+        : (parentNode ? (parentNode as any).planCategory : null) ?? null;
+
+    const resolvedOwner: string | null =
+      (data.owner != null && data.owner !== '')
+        ? data.owner
+        : (parentNode ? (parentNode as any).owner : (data.level === 1 ? null : 'Owner')) ?? null;
+
+    const resolvedPriority: string =
+      (data.priority != null && data.priority !== '')
+        ? data.priority
+        : (parentNode ? (parentNode as any).priority : 'P1') ?? 'P1';
 
     // ── targetDate 类型转换 ────────────────────────────────────────
     let targetDate: Date | null = null;
@@ -1034,12 +1120,11 @@ app.post('/api/nodes', async (req, res) => {
           message: `L5 工作包的父节点必须是 L4（模块），当前父节点层级为 L${parentNode.level}`,
         });
       }
-      // monthCode 对 L5 强制必填，为全自动月报提供准确时间轴索引
+      // monthCode：前端未传时自动补当前月份，确保月报聚合有时间轴索引
       if (!data.monthCode || !String(data.monthCode).trim()) {
-        return res.status(400).json({
-          error: 'L5_REQUIRES_MONTH_CODE',
-          message: 'L5 工作包必须提供 monthCode（格式：YYYY-MM），用于月报自动聚合',
-        });
+        const now = new Date();
+        data.monthCode = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        console.log(`ℹ️ L5 未传 monthCode，自动补充为当前月份: ${data.monthCode}`);
       }
       // monthCode 格式校验：YYYY-MM
       if (!/^\d{4}-\d{2}$/.test(String(data.monthCode))) {
@@ -1064,17 +1149,56 @@ app.post('/api/nodes', async (req, res) => {
           message: `L6 执行活动的父节点必须是 L5（工作包），当前父节点层级为 L${parentNode.level}`,
         });
       }
+      // weekCode：前端未传时自动补当前周，确保周报聚合有时间轴索引
+      if (!data.weekCode || !String(data.weekCode).trim()) {
+        data.weekCode = getISOWeekCode(new Date());
+        console.log(`ℹ️ L6 未传 weekCode，自动补充为当前周: ${data.weekCode}`);
+      }
+      // monthCode：前端未传时从父节点 L5 继承，或自动补当前月
+      if (!data.monthCode || !String(data.monthCode).trim()) {
+        const parentMonthCode = (parentNode as any).monthCode;
+        if (parentMonthCode) {
+          data.monthCode = parentMonthCode;
+        } else {
+          const now = new Date();
+          data.monthCode = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        }
+        console.log(`ℹ️ L6 未传 monthCode，自动补充为: ${data.monthCode}`);
+      }
     }
+
+    /* ── 自动生成节点编码 ──────────────────────────────────────────────── */
+    // 1. 计算当前节点在同级中的序号（用于拼接编码）
+    const siblingCode = await getNextSiblingCode(parentId, data.level);
+    // 2. 继承父节点的各层编码字段
+    const inheritedCodes = {
+      planCategoryCode: (parentNode as any)?.planCategoryCode ?? null,
+      objectiveCode:    (parentNode as any)?.objectiveCode    ?? null,
+      krCode:           (parentNode as any)?.krCode           ?? null,
+      detail1Code:      (parentNode as any)?.detail1Code      ?? null,
+      detail2Code:      (parentNode as any)?.detail2Code      ?? null,
+    };
+    // 3. 根据层级，将 siblingCode 写入对应字段
+    const ownCodeField: Record<number, string> = {
+      1: 'planCategoryCode', 2: 'objectiveCode', 3: 'krCode',
+      4: 'detail1Code',      5: 'detail2Code',
+    };
+    const levelCodeField = ownCodeField[data.level];
+    const levelCodes = { ...inheritedCodes };
+    if (levelCodeField) (levelCodes as any)[levelCodeField] = siblingCode;
+    // 4. 拼接 nodeNumber（失败时为 null，不阻塞创建）
+    const autoNodeNumber = await buildNodeNumber(data.level, { ...parentNode, ...inheritedCodes }, siblingCode);
+    /* ─────────────────────────────────────────────────────────────────── */
 
     const newNode = await prisma.planNode.create({
       data: {
         title: data.title,
         parentId,
         level: data.level,
-        // owner：L1 可为空，L2-L5 必填；若未传则继承父节点，最终兜底 'Owner'
-        owner: data.owner || (parentNode ? parentNode.owner : (data.level === 1 ? null : 'Owner')),
-        priority: data.priority || (parentNode ? parentNode.priority : 'P1'),
-        planStatus: data.planStatus || (parentNode ? (parentNode as any).planStatus : 'PLANNED'),
+        owner: resolvedOwner,
+        priority: resolvedPriority,
+        // 子节点状态默认 PLANNED，不继承父节点状态（避免子节点创建即 IN_PROGRESS）
+        planStatus: data.planStatus || 'PLANNED',
         planCategory,
         targetDate,
         progress,
@@ -1085,6 +1209,9 @@ app.post('/api/nodes', async (req, res) => {
         monthCode: data.monthCode ?? (parentNode ? (parentNode as any).monthCode : null) ?? null,
         weekCode: data.weekCode ?? null,
         rootId,
+        // 编码字段（自动生成）
+        ...levelCodes,
+        nodeNumber: autoNodeNumber ?? undefined,
       }
     });
     if (!data.parentId && !rootId) {
@@ -1696,16 +1823,6 @@ app.patch('/api/daily-schedules/top-task', async (req, res) => {
     res.status(500).json({ error: 'Failed to update top task' });
   }
 });
-      syncedNode = await syncL6NodeFromSchedule(finalNodeId, updated.remark ?? null);
-    }
-
-    res.json({ ...updated, syncedNode });
-  } catch (error) {
-    console.error('❌ PATCH /api/daily-schedules/:id 失败:', error);
-    res.status(500).json({ error: 'Failed to update daily schedule' });
-  }
-});
-
 // 删除日程
 app.delete('/api/daily-schedules/:id', async (req, res) => {
   try {
@@ -2453,7 +2570,354 @@ app.post('/api/audit/push-wecom', async (req, res) => {
   }
 });
 
-// 显式绑定到 0.0.0.0，允许局域网设备访问（例如手机）
+// ── 周报自动聚合接口 ──────────────────────────────────────────────────────────
+
+/**
+ * GET /api/reports/weekly?date=YYYY-MM-DD
+ *
+ * 聚合该周（周一~周日）内的执行数据，返回三层结构：
+ *   L4 标题 → L5 标题 → L6 任务列表（含实际工时）
+ *
+ * 返回结构：
+ *   {
+ *     weekCode,          // 如 "2026-W11"
+ *     weekRange,         // { start: "2026-03-09", end: "2026-03-15" }
+ *     completed: [...],  // 本周已完成的 L6（planStatus=DONE）
+ *     inProgress: [...], // 进行中的 L5 + L6（planStatus=IN_PROGRESS）
+ *     hierarchy: [...],  // L4→L5→L6 三层结构（含工时）
+ *     stats: { totalHours, completedCount, inProgressCount, l5Count }
+ *   }
+ */
+app.get('/api/reports/weekly', async (req, res) => {
+  try {
+    const dateParam = (req.query.date as string) || new Date().toISOString().slice(0, 10);
+    const baseDate  = new Date(dateParam);
+    if (Number.isNaN(baseDate.getTime())) {
+      return res.status(400).json({ error: 'date 格式无效，请使用 YYYY-MM-DD' });
+    }
+
+    // ── 计算本周的周一和周日 ──────────────────────────────────────
+    const weekCode = getISOWeekCode(baseDate);
+    const dow = baseDate.getDay() === 0 ? 7 : baseDate.getDay(); // 1=周一 … 7=周日
+    const monday = new Date(baseDate);
+    monday.setDate(baseDate.getDate() - dow + 1);
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+
+    const weekStart = monday.toISOString().slice(0, 10);
+    const weekEnd   = sunday.toISOString().slice(0, 10);
+
+    // ── 1. 查询本周 L6 已完成节点 ────────────────────────────────
+    const completedL6 = await prisma.planNode.findMany({
+      where: { level: 6, weekCode, planStatus: 'DONE' },
+      select: {
+        id: true, title: true, priority: true, progress: true,
+        planStatus: true, planCategory: true, dataFeedback: true,
+        parentId: true,
+      },
+      orderBy: [{ priority: 'asc' }, { id: 'asc' }],
+    });
+
+    // ── 2. 查询进行中的 L5 和 L6 ─────────────────────────────────
+    const inProgressNodes = await prisma.planNode.findMany({
+      where: {
+        level: { in: [5, 6] },
+        planStatus: 'IN_PROGRESS',
+      },
+      select: {
+        id: true, title: true, level: true, priority: true,
+        progress: true, planStatus: true, planCategory: true,
+        monthCode: true, weekCode: true, parentId: true,
+      },
+      orderBy: [{ level: 'asc' }, { priority: 'asc' }],
+    });
+
+    // ── 3. 查询本周 DailySchedule，统计各 L6 实际工时 ────────────
+    const weekSchedules = await (prisma as any).dailySchedule.findMany({
+      where: {
+        date: { gte: weekStart, lte: weekEnd },
+        nodeId: { not: null },
+      },
+      select: { nodeId: true, startTime: true, endTime: true, date: true, taskName: true },
+    });
+
+    // 计算每个 nodeId 的实际工时（分钟 → 小时）
+    const hoursMap: Record<number, number> = {};
+    for (const s of weekSchedules) {
+      if (!s.nodeId) continue;
+      const [sh, sm] = String(s.startTime).split(':').map(Number);
+      const [eh, em] = String(s.endTime).split(':').map(Number);
+      const minutes = (eh * 60 + em) - (sh * 60 + sm);
+      if (minutes > 0) {
+        hoursMap[s.nodeId] = (hoursMap[s.nodeId] ?? 0) + minutes / 60;
+      }
+    }
+
+    // ── 4. 构建 L4→L5→L6 三层层级结构 ───────────────────────────
+    // 收集本周涉及的所有 L5 parentId（来自 completedL6 + inProgressNodes 中的 L6）
+    const allL6 = [
+      ...completedL6,
+      ...inProgressNodes.filter((n: any) => n.level === 6),
+    ];
+    const l5Ids = [...new Set(allL6.map((n: any) => n.parentId).filter(Boolean))] as number[];
+
+    // 查询这些 L5 节点
+    const l5Nodes = l5Ids.length > 0
+      ? await prisma.planNode.findMany({
+          where: { id: { in: l5Ids } },
+          select: { id: true, title: true, level: true, priority: true, progress: true, planStatus: true, monthCode: true, parentId: true },
+        })
+      : [];
+
+    // 查询 L5 对应的 L4 节点
+    const l4Ids = [...new Set(l5Nodes.map((n: any) => n.parentId).filter(Boolean))] as number[];
+    const l4Nodes = l4Ids.length > 0
+      ? await prisma.planNode.findMany({
+          where: { id: { in: l4Ids } },
+          select: { id: true, title: true, level: true, priority: true, progress: true, planStatus: true },
+        })
+      : [];
+
+    // 建立快速查找 Map
+    const l5Map = new Map(l5Nodes.map((n: any) => [n.id, n]));
+    const l4Map = new Map(l4Nodes.map((n: any) => [n.id, n]));
+
+    // 为每个 L6 附加 L5/L4 标题和实际工时
+    const enrichL6 = (node: any) => {
+      const l5 = l5Map.get(node.parentId);
+      const l4 = l5 ? l4Map.get((l5 as any).parentId) : null;
+      return {
+        ...node,
+        actualHours: Math.round((hoursMap[node.id] ?? 0) * 100) / 100,
+        l5Title: (l5 as any)?.title ?? null,
+        l5Id:    (l5 as any)?.id    ?? null,
+        l4Title: (l4 as any)?.title ?? null,
+        l4Id:    (l4 as any)?.id    ?? null,
+      };
+    };
+
+    // 构建 L4→L5→L6 嵌套结构
+    const hierarchy = l4Nodes.map((l4: any) => {
+      const children = l5Nodes
+        .filter((l5: any) => l5.parentId === l4.id)
+        .map((l5: any) => {
+          const l6List = allL6
+            .filter((l6: any) => l6.parentId === l5.id)
+            .map((l6: any) => ({
+              ...l6,
+              actualHours: Math.round((hoursMap[l6.id] ?? 0) * 100) / 100,
+            }));
+          const l5Hours = l6List.reduce((s: number, n: any) => s + n.actualHours, 0);
+          return {
+            ...l5,
+            actualHours: Math.round(l5Hours * 100) / 100,
+            l6Nodes: l6List,
+          };
+        });
+      const l4Hours = children.reduce((s: number, n: any) => s + n.actualHours, 0);
+      return {
+        ...l4,
+        actualHours: Math.round(l4Hours * 100) / 100,
+        l5Nodes: children,
+      };
+    });
+
+    // ── 5. 汇总统计 ───────────────────────────────────────────────
+    const totalHours = Math.round(
+      Object.values(hoursMap).reduce((s, h) => s + h, 0) * 100
+    ) / 100;
+
+    console.log(`📊 [reports/weekly] weekCode=${weekCode} completed=${completedL6.length} inProgress=${inProgressNodes.length} totalHours=${totalHours}`);
+
+    res.json({
+      weekCode,
+      weekRange: { start: weekStart, end: weekEnd },
+      completed:  completedL6.map(enrichL6),
+      inProgress: inProgressNodes.map((n: any) => n.level === 6 ? enrichL6(n) : {
+        ...n,
+        l4Title: l4Map.get((l5Map.get(n.id) as any)?.parentId as number)?.title ?? null,
+      }),
+      hierarchy,
+      stats: {
+        totalHours,
+        completedCount:  completedL6.length,
+        inProgressCount: inProgressNodes.length,
+        l5Count:         l5Nodes.length,
+        l4Count:         l4Nodes.length,
+      },
+    });
+  } catch (error) {
+    console.error('❌ GET /api/reports/weekly 失败:', error);
+    res.status(500).json({ error: 'Failed to generate weekly report' });
+  }
+});
+
+// ── 周报锁定与智能滚入 ────────────────────────────────────────────────────────
+
+/**
+ * POST /api/nodes/week-report/lock
+ *
+ * 手动触发（用户点击"生成周报"时调用），执行两件事：
+ *   1. 维度审计：按 planCategory 区分工作日/全周范围，快照本周 L6 状态
+ *   2. 智能滚入：将 IN_PROGRESS_CROSS_WEEK 的节点复制到下一周
+ *
+ * Body: { weekCode?: string }  — 不传则默认当前周
+ *
+ * 返回:
+ *   {
+ *     weekCode,
+ *     snapshot: { work: [...], life: [...], growth: [...] },
+ *     rolledOver: [{ originalId, newId, title }],
+ *     auditContext: AuditContext
+ *   }
+ */
+app.post('/api/nodes/week-report/lock', async (req, res) => {
+  try {
+    const { weekCode: bodyWeekCode } = req.body ?? {};
+    const weekCode = bodyWeekCode || getISOWeekCode(new Date());
+
+    /* 计算本周周一和周日 */
+    const [yearStr, weekStr] = weekCode.split('-W');
+    const year = parseInt(yearStr, 10);
+    const week = parseInt(weekStr, 10);
+    const jan4 = new Date(year, 0, 4);
+    const startOfWeek1 = new Date(jan4);
+    startOfWeek1.setDate(jan4.getDate() - ((jan4.getDay() + 6) % 7));
+    const monday = new Date(startOfWeek1);
+    monday.setDate(startOfWeek1.getDate() + (week - 1) * 7);
+    const friday = new Date(monday); friday.setDate(monday.getDate() + 4);
+    const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+
+    const weekStart = monday.toISOString().slice(0, 10);
+    const weekEnd   = sunday.toISOString().slice(0, 10);
+    const weekdayEnd = friday.toISOString().slice(0, 10);
+
+    /* 1. 维度审计：抓取本周所有 L6 节点 */
+    const allL6 = await prisma.planNode.findMany({
+      where: { level: 6, weekCode },
+      select: {
+        id: true, title: true, planStatus: true, progress: true,
+        priority: true, planCategory: true, dataFeedback: true,
+        issueLog: true, actualHours: true, parentId: true,
+      },
+    });
+
+    /* 按维度分组（工作=工作日范围，生活/成长=全周） */
+    const snapshot: Record<string, any[]> = { work: [], life: [], growth: [], other: [] };
+    for (const node of allL6) {
+      const cat = (node as any).planCategory;
+      if (cat === '工作')      snapshot.work.push(node);
+      else if (cat === '生活') snapshot.life.push(node);
+      else if (cat === '成长') snapshot.growth.push(node);
+      else                     snapshot.other.push(node);
+    }
+
+    /* 2. 智能滚入：IN_PROGRESS_CROSS_WEEK → 下一周副本 */
+    const crossWeekNodes = allL6.filter(
+      (n: any) => n.planStatus === 'IN_PROGRESS_CROSS_WEEK'
+    );
+
+    /* 计算下一周的 weekCode */
+    const nextMonday = new Date(monday); nextMonday.setDate(monday.getDate() + 7);
+    const nextWeekCode = getISOWeekCode(nextMonday);
+
+    const rolledOver: { originalId: number; newId: number; title: string }[] = [];
+
+    for (const node of crossWeekNodes) {
+      /* 继承原节点的所有编码字段，weekCode 更新为下一周 */
+      const inheritedRollCodes = {
+        planCategoryCode: (node as any).planCategoryCode ?? null,
+        objectiveCode:    (node as any).objectiveCode    ?? null,
+        krCode:           (node as any).krCode           ?? null,
+        detail1Code:      (node as any).detail1Code      ?? null,
+        detail2Code:      (node as any).detail2Code      ?? null,
+      };
+      /* 重新拼接 nodeNumber：用下一周的 weekCode 替换末段 */
+      const rollNodeNumber = await buildNodeNumber(6, { ...inheritedRollCodes, weekCode: nextWeekCode }, null);
+
+      const newNode = await prisma.planNode.create({
+        data: {
+          title:        `${(node as any).title}（持续）`,
+          level:        6,
+          parentId:     (node as any).parentId,
+          priority:     (node as any).priority ?? 'P1',
+          planStatus:   'IN_PROGRESS',
+          planCategory: (node as any).planCategory ?? null,
+          progress:     (node as any).progress ?? 0,
+          weekCode:     nextWeekCode,
+          monthCode:    (node as any).monthCode ?? null,
+          /* 继承原节点的 issueLog 作为背景说明 */
+          issueLog:     (node as any).issueLog
+            ? `【上周延续】${(node as any).issueLog}`
+            : '【上周延续】',
+          /* 继承编码字段，保留血缘 */
+          ...inheritedRollCodes,
+          nodeNumber: rollNodeNumber ?? undefined,
+        },
+      });
+      rolledOver.push({
+        originalId: (node as any).id,
+        newId:      newNode.id,
+        title:      (node as any).title,
+      });
+    }
+
+    /* 3. 调用 AI 审计服务生成 AuditContext */
+    const { getAuditContext } = await import('./services/audit_service');
+    const auditContext = await getAuditContext(weekCode);
+
+    console.log(
+      `🔒 [week-report/lock] weekCode=${weekCode} l6=${allL6.length} crossWeek=${crossWeekNodes.length} rolledOver=${rolledOver.length}`
+    );
+
+    res.json({
+      weekCode,
+      weekRange: { start: weekStart, end: weekEnd, weekdayEnd },
+      snapshot,
+      rolledOver,
+      auditContext,
+    });
+  } catch (error) {
+    console.error('❌ POST /api/nodes/week-report/lock 失败:', error);
+    res.status(500).json({ error: 'Failed to lock week report' });
+  }
+});
+
+/**
+ * POST /api/nodes/week-report/audit
+ * 在 lock 之后调用，触发 AI 生成 200 字教练点评并写入 AuditReport 表。
+ *
+ * Body: { weekCode?: string }
+ */
+app.post('/api/nodes/week-report/audit', async (req, res) => {
+  try {
+    const { weekCode: bodyWeekCode } = req.body ?? {};
+    const weekCode = bodyWeekCode || getISOWeekCode(new Date());
+
+    const { getAuditContext, generateWeekAudit } = await import('./services/audit_service');
+    const ctx     = await getAuditContext(weekCode);
+    const result  = await generateWeekAudit(weekCode);
+
+    /* 写入 AuditReport 表（upsert，同一周只保留最新一份） */
+    const report = await (prisma as any).auditReport.upsert({
+      where: { reportType_periodCode: { reportType: 'WEEK', periodCode: weekCode } },
+      update: { content: result.coaching, snapshotData: JSON.stringify(ctx) },
+      create: {
+        reportType:   'WEEK',
+        periodCode:   weekCode,
+        content:      result.coaching,
+        snapshotData: JSON.stringify(ctx),
+      },
+    });
+
+    console.log(`✅ [week-report/audit] weekCode=${weekCode} completionRate=${result.context.completionRate}%`);
+    res.json({ weekCode, coaching: result.coaching, context: result.context, generatedAt: result.generatedAt, reportId: report.id });
+  } catch (error) {
+    console.error('❌ POST /api/nodes/week-report/audit 失败:', error);
+    res.status(500).json({ error: 'Failed to generate week audit' });
+  }
+});
+
 app.listen(PORT_NUMBER, '0.0.0.0', () => {
   console.log(`🚀 Server is running on http://192.168.5.62:${PORT_NUMBER}`);
 });

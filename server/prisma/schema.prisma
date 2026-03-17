@@ -34,7 +34,11 @@ model PlanNode {
   // 进度与状态
   plannedEndDate String?   // 上线时间 (e.g. '3月下旬', '1月内')
   actualEndDate  DateTime? // 实际完成时间
-  planStatus     String?   // 计划状态 (e.g. '上线', '提测')
+  planStatus     String?   @default("PLANNED")
+  // 合法值：'PLANNED' | 'IN_PROGRESS' | 'IN_PROGRESS_CROSS_WEEK' | 'DONE' | 'DEFERRED' | 'CANCELLED'
+  // IN_PROGRESS_CROSS_WEEK = 跨周进行中（本周未完成，周报锁定时自动滚入下周）
+  // DEFERRED               = 延后（主动推迟，不自动滚入）
+  // CANCELLED              = 废弃（不再执行）
   periodType     String?   // 'YEAR' | 'MONTH' | 'WEEK'
   
   // [New] 7层基因编码 (WBS DNA)
