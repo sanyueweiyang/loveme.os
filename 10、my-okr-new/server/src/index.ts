@@ -2918,6 +2918,216 @@ app.post('/api/nodes/week-report/audit', async (req, res) => {
   }
 });
 
+// ── 月度认领接口 ──────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/assignments
+ * 将一个节点（通常是 L5）认领到某个月，设定本月计划进度增量。
+ * 同一节点可在不同月份多次认领。
+ *
+ * Body: { nodeId, monthCode?, plannedIncrement?, assignee?, remark? }
+ */
+app.post('/api/assignments', async (req, res) => {
+  try {
+    const { nodeId, monthCode, plannedIncrement: _pi, planned_increment: _pi2, assignee, remark } = req.body ?? {};
+    const plannedIncrement = _pi ?? _pi2; // 兼容驼峰和下划线两种命名
+
+    if (!nodeId) {
+      return res.status(400).json({ error: 'MISSING_NODE_ID', message: 'nodeId 必填' });
+    }
+    const parsedNodeId = parseInt(String(nodeId), 10);
+    if (Number.isNaN(parsedNodeId)) {
+      return res.status(400).json({ error: 'INVALID_NODE_ID', message: 'nodeId 必须是数字' });
+    }
+
+    // 验证节点存在
+    const node = await prisma.planNode.findUnique({ where: { id: parsedNodeId } });
+    if (!node) {
+      return res.status(404).json({ error: 'NODE_NOT_FOUND', message: `节点 ${parsedNodeId} 不存在` });
+    }
+
+    // monthCode 未传则自动补当前月
+    const now = new Date();
+    const resolvedMonthCode = (monthCode && /^\d{4}-\d{2}$/.test(String(monthCode)))
+      ? String(monthCode)
+      : `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+    const parsedIncrement = plannedIncrement != null
+      ? Math.min(100, Math.max(0, parseInt(String(plannedIncrement), 10) || 0))
+      : 0;
+
+    const assignment = await (prisma as any).nodeAssignment.create({
+      data: {
+        nodeId:           parsedNodeId,
+        monthCode:        resolvedMonthCode,
+        plannedIncrement: parsedIncrement,
+        assignee:         assignee ? String(assignee) : ((node as any).owner ?? null),
+        remark:           remark ? String(remark) : null,
+      },
+    });
+
+    /* ── 自动累加更新节点 progress ──────────────────────────────────
+     * 规则：将本次 plannedIncrement 累加到节点当前 progress，上限 100。
+     * 这样每次认领一个月的增量目标，节点进度自动向前推进。
+     * ──────────────────────────────────────────────────────────── */
+    let updatedNode = node;
+    if (parsedIncrement > 0) {
+      const currentProgress = (node as any).progress ?? 0;
+      const newProgress = Math.min(100, currentProgress + parsedIncrement);
+      updatedNode = await prisma.planNode.update({
+        where: { id: parsedNodeId },
+        data: {
+          progress:   newProgress,
+          // 进度达到 100 时自动标记完成
+          planStatus: newProgress >= 100 ? 'DONE' : ((node as any).planStatus === 'PLANNED' ? 'IN_PROGRESS' : (node as any).planStatus),
+        },
+      });
+      console.log(`📈 [assignments] 节点 ${parsedNodeId} progress: ${currentProgress}% → ${newProgress}%`);
+    }
+
+    console.log(`✅ [assignments] 节点 ${parsedNodeId}「${(node as any).title}」已认领到 ${resolvedMonthCode}，计划增量 ${parsedIncrement}%`);
+    // 返回对象字段对齐：month_code（下划线）优先，避免前端字段漂移
+    res.json({
+      assignment: {
+        ...assignment,
+        month_code: assignment.monthCode,
+        planned_increment: assignment.plannedIncrement,
+      },
+      node: {
+        id:         (updatedNode as any).id,
+        title:      (updatedNode as any).title,
+        progress:   (updatedNode as any).progress,
+        planStatus: (updatedNode as any).planStatus,
+      },
+    });
+  } catch (error) {
+    console.error('❌ POST /api/assignments 失败:', error);
+    res.status(500).json({ error: 'Failed to create assignment' });
+  }
+});
+
+/**
+ * GET /api/assignments
+ * 查询认领记录。支持按 nodeId、monthCode 过滤。
+ *
+ * Query: { nodeId?, monthCode? }
+ */
+app.get('/api/assignments', async (req, res) => {
+  try {
+    const { nodeId, monthCode } = req.query;
+    const where: any = {};
+    if (nodeId) {
+      const id = parseInt(String(nodeId), 10);
+      if (!Number.isNaN(id)) where.nodeId = id;
+    }
+    if (monthCode) where.monthCode = String(monthCode);
+
+    const assignments = await (prisma as any).nodeAssignment.findMany({
+      where,
+      include: {
+        planNode: {
+          select: { id: true, title: true, level: true, progress: true, planStatus: true, planCategory: true },
+        },
+      },
+      orderBy: [{ monthCode: 'desc' }, { createdAt: 'desc' }],
+    });
+
+    // 返回对象字段对齐：month_code（下划线）优先
+    res.json(assignments.map((a: any) => ({
+      ...a,
+      month_code: a.monthCode,
+      planned_increment: a.plannedIncrement,
+    })));
+  } catch (error) {
+    console.error('❌ GET /api/assignments 失败:', error);
+    res.status(500).json({ error: 'Failed to fetch assignments' });
+  }
+});
+
+/**
+ * DELETE /api/assignments/:id
+ *
+ * 精准删除某个月的认领记录：仅删除 assignments 表中的记录，不触碰 PlanNode 本体。
+ * （严禁在此路由删除 PlanNode，避免前端误触发 HAS_CHILDREN）
+ */
+app.delete('/api/assignments/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+    const { deleteNodeAssignment } = await import('./services/planService');
+    const deleted = await deleteNodeAssignment(id);
+    console.log(`🗑️ [assignments] 已删除认领记录 id=${id}（仅 assignments，不触碰 PlanNode）`);
+    res.json({
+      ...deleted,
+      month_code: (deleted as any).monthCode,
+      planned_increment: (deleted as any).plannedIncrement,
+    });
+  } catch (error) {
+    console.error('❌ DELETE /api/assignments/:id 失败:', error);
+    res.status(500).json({ error: 'Failed to delete assignment' });
+  }
+});
+
+// ── 待办节点查询 ──────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/nodes/todo
+ * 返回所有未完成（planStatus != DONE）的节点，附带全局进度汇总。
+ *
+ * Query: { level?, planCategory?, monthCode?, weekCode? }
+ */
+app.get('/api/nodes/todo', async (req, res) => {
+  try {
+    const { level, planCategory, monthCode, weekCode } = req.query;
+    const where: any = {
+      planStatus: { not: 'DONE' },
+    };
+    if (level)       where.level       = parseInt(String(level), 10);
+    if (planCategory) where.planCategory = String(planCategory);
+    if (monthCode)   where.monthCode   = String(monthCode);
+    if (weekCode)    where.weekCode    = String(weekCode);
+
+    const nodes = await prisma.planNode.findMany({
+      where,
+      select: {
+        id: true, title: true, level: true, priority: true,
+        planStatus: true, planCategory: true, progress: true,
+        parentId: true, monthCode: true, weekCode: true,
+        owner: true, targetDate: true, dataFeedback: true,
+      },
+      orderBy: [{ priority: 'asc' }, { level: 'asc' }, { id: 'asc' }],
+    });
+
+    // 全局进度汇总：所有未完成节点的平均进度
+    const totalProgress = nodes.length > 0
+      ? Math.round(nodes.reduce((s: number, n: any) => s + (n.progress ?? 0), 0) / nodes.length)
+      : 0;
+
+    // 按维度分组统计
+    const byCategory: Record<string, { count: number; avgProgress: number }> = {};
+    for (const n of nodes) {
+      const cat = (n as any).planCategory ?? '未分类';
+      if (!byCategory[cat]) byCategory[cat] = { count: 0, avgProgress: 0 };
+      byCategory[cat].count++;
+      byCategory[cat].avgProgress += (n as any).progress ?? 0;
+    }
+    for (const k of Object.keys(byCategory)) {
+      byCategory[k].avgProgress = Math.round(byCategory[k].avgProgress / byCategory[k].count);
+    }
+
+    console.log(`📋 [nodes/todo] 未完成节点: ${nodes.length} 条，全局进度: ${totalProgress}%`);
+    res.json({
+      total: nodes.length,
+      totalProgress,
+      byCategory,
+      nodes,
+    });
+  } catch (error) {
+    console.error('❌ GET /api/nodes/todo 失败:', error);
+    res.status(500).json({ error: 'Failed to fetch todo nodes' });
+  }
+});
+
 app.listen(PORT_NUMBER, '0.0.0.0', () => {
   console.log(`🚀 Server is running on http://192.168.5.62:${PORT_NUMBER}`);
 });

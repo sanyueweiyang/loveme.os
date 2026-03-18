@@ -1,0 +1,178 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@layer base {
+  :root {
+    --background: 0 0% 99%;
+    --foreground: 230 25% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 230 25% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 230 25% 10%;
+
+    --primary: 245 58% 51%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 230 25% 10%;
+
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+
+    --accent: 220 14% 96%;
+    --accent-foreground: 230 25% 10%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 245 58% 51%;
+
+    --radius: 0.5rem;
+
+    /* LoveMe OS custom tokens */
+    --wbs-strategy: 245 58% 51%;
+    --wbs-management: 200 80% 44%;
+    --wbs-execution: 160 60% 40%;
+
+    /* Per-layer theme colors */
+    --wbs-l1: 265 70% 50%;
+    --wbs-l2: 245 58% 51%;
+    --wbs-l3: 215 72% 48%;
+    --wbs-l4: 200 80% 44%;
+    --wbs-l5: 180 60% 42%;
+    --wbs-l6: 152 60% 40%;
+
+    --status-on-track: 152 60% 40%;
+    --status-at-risk: 38 92% 50%;
+    --status-behind: 0 72% 51%;
+    --status-completed: 220 9% 46%;
+    --status-not-started: 220 13% 78%;
+
+    --surface-raised: 0 0% 100%;
+    --surface-sunken: 220 14% 97%;
+
+    --cal-work: 245 58% 51%;
+    --cal-life: 330 65% 55%;
+    --cal-growth: 160 60% 40%;
+
+    /* Category dimension colors: 工作/生活/成长 */
+    --cat-work: 215 72% 48%;
+    --cat-life: 152 60% 42%;
+    --cat-growth: 38 85% 52%;
+
+    --sidebar-background: 230 25% 6%;
+    --sidebar-foreground: 220 14% 80%;
+    --sidebar-primary: 245 58% 60%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 230 20% 12%;
+    --sidebar-accent-foreground: 220 14% 90%;
+    --sidebar-border: 230 15% 15%;
+    --sidebar-ring: 245 58% 51%;
+  }
+
+  .dark {
+    --background: 230 25% 6%;
+    --foreground: 220 14% 92%;
+
+    --card: 230 20% 9%;
+    --card-foreground: 220 14% 92%;
+
+    --popover: 230 20% 9%;
+    --popover-foreground: 220 14% 92%;
+
+    --primary: 245 58% 60%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 230 15% 15%;
+    --secondary-foreground: 220 14% 92%;
+
+    --muted: 230 15% 15%;
+    --muted-foreground: 220 9% 55%;
+
+    --accent: 230 15% 15%;
+    --accent-foreground: 220 14% 92%;
+
+    --destructive: 0 62% 40%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 230 15% 18%;
+    --input: 230 15% 18%;
+    --ring: 245 58% 60%;
+
+    --wbs-strategy: 245 58% 65%;
+    --wbs-management: 200 80% 55%;
+    --wbs-execution: 160 60% 50%;
+
+    --wbs-l1: 265 70% 65%;
+    --wbs-l2: 245 58% 65%;
+    --wbs-l3: 215 72% 58%;
+    --wbs-l4: 200 80% 55%;
+    --wbs-l5: 180 60% 52%;
+    --wbs-l6: 152 60% 50%;
+
+    --status-on-track: 152 60% 50%;
+    --status-at-risk: 38 92% 55%;
+    --status-behind: 0 72% 55%;
+    --status-completed: 220 9% 55%;
+    --status-not-started: 220 13% 35%;
+
+    --surface-raised: 230 20% 12%;
+    --surface-sunken: 230 25% 5%;
+
+    --sidebar-background: 230 25% 4%;
+    --sidebar-foreground: 220 14% 75%;
+    --sidebar-primary: 245 58% 65%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 230 20% 10%;
+    --sidebar-accent-foreground: 220 14% 85%;
+    --sidebar-border: 230 15% 12%;
+    --sidebar-ring: 245 58% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+@layer utilities {
+  .text-wbs-strategy {
+    color: hsl(var(--wbs-strategy));
+  }
+  .text-wbs-management {
+    color: hsl(var(--wbs-management));
+  }
+  .text-wbs-execution {
+    color: hsl(var(--wbs-execution));
+  }
+  .bg-wbs-strategy {
+    background-color: hsl(var(--wbs-strategy));
+  }
+  .bg-wbs-management {
+    background-color: hsl(var(--wbs-management));
+  }
+  .bg-wbs-execution {
+    background-color: hsl(var(--wbs-execution));
+  }
+  .scrollbar-none {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+}

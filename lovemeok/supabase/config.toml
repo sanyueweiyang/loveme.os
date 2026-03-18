@@ -1,0 +1,7 @@
+project_id = "ygkcidmwnclifmorpwfs"
+
+[functions.api-proxy]
+verify_jwt = false
+
+[functions.backend-proxy]
+verify_jwt = false
